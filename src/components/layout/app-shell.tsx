@@ -186,16 +186,24 @@ export function AppShell({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
   useEffect(() => {
     let cancelled = false;
-    let dispose: (() => void) | undefined;
-    void listen<{ id: string }>("nav:artist", (e) => {
-      void navigate({ to: "/artist/$id", params: { id: e.payload.id } });
-    }).then((un) => {
-      if (cancelled) un();
-      else dispose = un;
-    });
+    const disposers: (() => void)[] = [];
+    const bind = <T,>(event: string, run: (payload: T) => void) => {
+      void listen<T>(event, (e) => run(e.payload)).then((un) => {
+        if (cancelled) un();
+        else disposers.push(un);
+      });
+    };
+    bind<{ id: string }>("nav:artist", ({ id }) =>
+      navigate({ to: "/artist/$id", params: { id } }),
+    );
+    // Ported from upstream 6f4f2fb: album deep links (ytubic:// + universal)
+    // need the same floating-window short-circuit as artists.
+    bind<{ id: string }>("nav:album", ({ id }) =>
+      navigate({ to: "/album/$id", params: { id } }),
+    );
     return () => {
       cancelled = true;
-      dispose?.();
+      for (const un of disposers) un();
     };
   }, [navigate]);
 
@@ -205,7 +213,9 @@ export function AppShell({ children }: { children: ReactNode }) {
         style={
           {
             "--sidebar-width": `${sidebarWidth}px`,
-            "--sidebar-width-icon": "4rem",
+            // Ported from upstream 6f4f2fb: rail is 56px (3.5rem) with
+            // 36x28 rows so a row reads as a pill. Fork was 4rem.
+            "--sidebar-width-icon": "3.5rem",
           } as React.CSSProperties
         }
       >

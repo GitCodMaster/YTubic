@@ -1,29 +1,39 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "sonner";
+// Tabler, per the design system. Every Browse row swaps to its filled
+// twin when active. The design draws Library as a bookshelf, which in
+// Tabler ships outline-only, so Library wears the bookmarks glyph — it
+// has the filled twin the active state needs, and it doesn't collide
+// with the compass above it or the playlist rows below.
 import {
-  HomeIcon,
-  CompassIcon,
-  SearchIcon,
-  LibraryIcon,
-  SettingsIcon,
-  HeartIcon,
-  ListMusicIcon,
-  PinIcon,
-  PinOffIcon,
-  EyeOffIcon,
-  UserPlusIcon,
-  UserCogIcon,
-  UsersRoundIcon,
-  CreditCardIcon,
-  LogInIcon,
-  LogOutIcon,
-  ExternalLinkIcon,
-  CheckIcon,
-} from "lucide-react";
+  IconHome,
+  IconHomeFilled,
+  IconBrandSafari,
+  IconSearch,
+  IconSearchFilled,
+  IconBookmarks,
+  IconBookmarksFilled,
+  IconSettings,
+  IconPlaylist,
+  IconPinFilled,
+  IconCreditCardFilled,
+  IconLogin,
+  IconLogout,
+  IconExternalLink,
+  IconCheck,
+} from "@tabler/icons-react";
+import {
+  IconBrandSafariFilled,
+  IconEyeOffFilled,
+  IconPinnedOffFilled,
+  IconUserCogFilled,
+  IconUserPlusFilled,
+  IconUsersGroupFilled,
+} from "@/components/shared/filled-icons";
 import {
   Sidebar,
   SidebarContent,
@@ -58,18 +68,16 @@ import {
   usePinned,
   usePinnedPlaylistsStore,
 } from "@/lib/store/pinned-playlists";
-import { fetchLibraryPlaylists } from "@/lib/innertube/library";
-import { pickThumbnail } from "@/components/shared/thumbnail";
+import { IS_BETA_PLATFORM } from "@/lib/platform";
 import { openChannelPicker } from "@/lib/store/channel-picker";
 import { openSettings } from "@/lib/store/settings-dialog";
 import { UpdateBanner } from "@/components/layout/update-banner";
+import { fetchLibraryPlaylists } from "@/lib/innertube/library";
+import type { ShelfItem } from "@/lib/innertube/types";
 import { resetInnertube } from "@/lib/innertube/client";
 import { accountSlot } from "@/lib/auth-presence";
 import { usePremiumStore } from "@/lib/store/premium";
-import {
-  accountInfoQuery,
-  authLoggedInQuery,
-} from "@/lib/store/auth-queries";
+import { accountInfoQuery, authLoggedInQuery } from "@/lib/store/auth-queries";
 import {
   removeAccount,
   switchAccount,
@@ -79,10 +87,25 @@ import {
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
-  { to: "/", label: "Home", icon: HomeIcon },
-  { to: "/explore", label: "Explore", icon: CompassIcon },
-  { to: "/search", label: "Search", icon: SearchIcon },
-  { to: "/library", label: "Library", icon: LibraryIcon },
+  { to: "/", label: "Home", icon: IconHome, iconOn: IconHomeFilled },
+  {
+    to: "/explore",
+    label: "Explore",
+    icon: IconBrandSafari,
+    iconOn: IconBrandSafariFilled,
+  },
+  {
+    to: "/search",
+    label: "Search",
+    icon: IconSearch,
+    iconOn: IconSearchFilled,
+  },
+  {
+    to: "/library",
+    label: "Library",
+    icon: IconBookmarks,
+    iconOn: IconBookmarksFilled,
+  },
 ] as const;
 
 // Liked Songs is the YTM magic playlist — browseId `VLLM` (wraps
@@ -90,39 +113,211 @@ const NAV_ITEMS = [
 // section, not user-removable.
 const LIKED_ID = "VLLM";
 
-const MENU_BTN_CLS = "group-data-[collapsible=icon]:mx-auto";
+// Artwork rows carry a 20px tile where the icon rows carry a 16px
+// glyph, so the menu button's fixed height would squeeze it. `h-auto`
+// hands the height back to the padding: 7px above and below puts the
+// row at 34px, a step over the 28px icon rows without opening the list
+// back up. Icon rows keep the fixed height.
+const ART_BTN_CLS = "h-auto py-[7px]";
 
 export function AppSidebar() {
   const { location } = useRouterState();
-  const pinned = usePinned();
-  const hidden = useHidden();
 
+  // The footer's divider only earns its keep when the playlist list is
+  // actually scrolling: then rows disappear under the footer and the
+  // hairline explains where the list ends. With a short list there's
+  // nothing to separate and the rule is just noise.
+  const [playlistsScroll, setPlaylistsScroll] = useState(false);
+
+  const isOn = (to: string) => location.pathname === to;
+  const isPlaylistOn = (id: string) => location.pathname === `/playlist/${id}`;
+
+  return (
+    <Sidebar
+      variant="floating"
+      collapsible="icon"
+      // Panel chrome, per the design system: a 12px glass card with a
+      // `--w110` hairline and a shallow, wide-spread shadow. The blur is
+      // what makes `--glass1` read as frosted over the album-art wash
+      // behind it rather than as flat translucency.
+      className="px-2 pb-2 pt-0 duration-300 ease-out [&>[data-slot=sidebar-inner]]:rounded-[12px] [&>[data-slot=sidebar-inner]]:border [&>[data-slot=sidebar-inner]]:border-w110 [&>[data-slot=sidebar-inner]]:bg-glass1 [&>[data-slot=sidebar-inner]]:shadow-[0_6px_18px_-14px_var(--k550)] [&>[data-slot=sidebar-inner]]:backdrop-blur-[24px]"
+    >
+      <SidebarHeader className="flex-row items-center gap-[9px] overflow-hidden px-4 pt-4 pb-2 group-data-[collapsible=icon]:ps-3.5 group-data-[collapsible=icon]:pe-2">
+        {/* Single round logo. Expanded it sits at px-4, in line with the
+         *  menu glyphs. On the rail the start inset puts its centre on the
+         *  rail's own axis (14 + 14 = 28), so it glides there instead of
+         *  hopping to a centered row. */}
+        <img
+          src="/ytubic-icon.svg"
+          alt="YTubic"
+          className="size-7 shrink-0 rounded-full"
+        />
+        <span
+          data-sidebar-label
+          className="shrink-0 text-[17px] font-semibold leading-none tracking-[-0.015em] text-t1"
+        >
+          YTubic
+        </span>
+        {IS_BETA_PLATFORM && (
+          <span
+            data-sidebar-label
+            title="The build for this OS is in beta — report anything broken via ⋯ → Report an issue."
+            className="shrink-0 rounded-[4px] border border-border/60 bg-muted/40 px-1 pb-px pt-0.5 text-[10px] font-semibold uppercase leading-none tracking-wider text-muted-foreground"
+          >
+            Beta
+          </span>
+        )}
+      </SidebarHeader>
+
+      {/* The content column itself doesn't scroll: Browse stays pinned
+          (shrink-0) and only the Playlists list scrolls, so the top nav
+          never slides out of view when the library is long. */}
+      <SidebarContent className="gap-0 overflow-hidden">
+        <SidebarGroup className="shrink-0 py-1 group-data-[collapsible=icon]:mt-1">
+          <SidebarGroupLabel>Browse</SidebarGroupLabel>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {NAV_ITEMS.map(({ to, label, icon, iconOn }) => {
+                const on = isOn(to);
+                const Icon = on ? iconOn : icon;
+                return (
+                  <SidebarMenuItem key={to}>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={on}
+                      tooltip={label}
+                    >
+                      <Link to={to}>
+                        <Icon />
+                        <span>{label}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+
+        <SidebarPlaylists
+          isPlaylistOn={isPlaylistOn}
+          onScrollableChange={setPlaylistsScroll}
+        />
+      </SidebarContent>
+
+      {/* A `--w055` hairline fences the footer off from the playlist
+          list, but only while that list scrolls — see `playlistsScroll`.
+          The border stays declared either way so the row keeps its
+          height and nothing shifts when the list crosses the threshold. */}
+      <SidebarFooter
+        className={cn(
+          "gap-2 border-t pt-3",
+          playlistsScroll ? "border-w055" : "border-transparent",
+          "group-data-[collapsible=icon]:px-2.5 group-data-[collapsible=icon]:pb-3",
+        )}
+      >
+        <UpdateBanner />
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip="Settings"
+              onClick={() => openSettings()}
+            >
+              <IconSettings />
+              <span>Settings</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+        <UserProfile />
+      </SidebarFooter>
+    </Sidebar>
+  );
+}
+
+type PlaylistRow = {
+  id: string;
+  title: string;
+  thumbnailUrl?: string;
+  pinned: boolean;
+};
+
+// Sidebar thumbnails render at 16px, so the largest source (last in the
+// list) is fine — the browser downscales it.
+function pickThumb(item: ShelfItem): string | undefined {
+  return item.thumbnails[item.thumbnails.length - 1]?.url;
+}
+
+/**
+ * The "Playlists" section. Shows Liked Songs, then every playlist in the
+ * user's library. Pinning doesn't gate visibility any more — it only
+ * floats a playlist to the top of the list (right under Liked Songs).
+ *
+ * Shares the `["library", "playlists"]` query cache with the Library
+ * page, so opening the sidebar costs no extra fetch once either has
+ * loaded. Pinned rows come from local storage and paint instantly, even
+ * before the library browse resolves.
+ */
+function SidebarPlaylists({
+  isPlaylistOn,
+  onScrollableChange,
+}: {
+  isPlaylistOn: (id: string) => boolean;
+  onScrollableChange: (scrollable: boolean) => void;
+}) {
   const loggedIn = useQuery(authLoggedInQuery);
-  const libraryPlaylists = useQuery({
+  const library = useQuery({
     queryKey: ["library", "playlists"],
     queryFn: fetchLibraryPlaylists,
     enabled: loggedIn.data === true,
     staleTime: 5 * 60_000,
   });
 
-  const isOn = (to: string) => location.pathname === to;
-  const isPlaylistOn = (id: string) =>
-    location.pathname === `/playlist/${id}`;
+  const pinned = usePinned();
+  const hidden = useHidden();
+  const pin = usePinnedPlaylistsStore((s) => s.pin);
+  const unpin = usePinnedPlaylistsStore((s) => s.unpin);
+  const hide = usePinnedPlaylistsStore((s) => s.hide);
 
-  // Flatten the library shelves and drop entries already shown above:
-  // Liked Songs (its own hardcoded row, id `VLLM`/`LM`) and anything the
-  // user has explicitly pinned (rendered with an unpin menu).
-  const pinnedIds = new Set(pinned.map((p) => p.id));
-  const hiddenIds = new Set(hidden);
-  const libraryItems = (libraryPlaylists.data ?? [])
-    .flatMap((s) => s.items)
-    .filter(
-      (it) =>
-        it.id !== LIKED_ID &&
-        it.id.replace(/^VL/, "") !== "LM" &&
-        !pinnedIds.has(it.id) &&
-        !hiddenIds.has(it.id),
-    );
+  const rows = useMemo<PlaylistRow[]>(() => {
+    const hiddenIds = new Set(hidden);
+    // Liked Songs (`VLLM`) ships in the playlists shelf too; drop it —
+    // it's always rendered as the hard-coded first row below. Hidden
+    // playlists are dropped entirely (un-hidden from the Library).
+    const libItems = (library.data ?? [])
+      .flatMap((s) => s.items)
+      .filter((it) => it.id !== LIKED_ID && !hiddenIds.has(it.id));
+    const libById = new Map(libItems.map((it) => [it.id, it]));
+    const pinnedIds = new Set(pinned.map((p) => p.id));
+
+    // Pinned first, in stored order. Prefer fresh library data for
+    // title/thumbnail, but keep a pin visible even when it isn't in the
+    // current library fetch (e.g. pinned from search results). A hidden
+    // id can't be pinned (the store keeps them exclusive), but filter
+    // defensively so a stale pin can never leak a hidden playlist back in.
+    const pinnedRows: PlaylistRow[] = pinned
+      .filter((p) => p.id !== LIKED_ID && !hiddenIds.has(p.id))
+      .map((p) => {
+        const lib = libById.get(p.id);
+        return {
+          id: p.id,
+          title: lib?.title ?? p.title,
+          thumbnailUrl: lib ? pickThumb(lib) : p.thumbnailUrl,
+          pinned: true,
+        };
+      });
+
+    // Everything else, in library order.
+    const restRows: PlaylistRow[] = libItems
+      .filter((it) => !pinnedIds.has(it.id))
+      .map((it) => ({
+        id: it.id,
+        title: it.title,
+        thumbnailUrl: pickThumb(it),
+        pinned: false,
+      }));
+
+    return [...pinnedRows, ...restRows];
+  }, [library.data, pinned, hidden]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -139,11 +334,17 @@ export function AppSidebar() {
     const update = () => {
       const distTop = el.scrollTop;
       const distBottom = el.scrollHeight - el.clientHeight - el.scrollTop;
-      el.style.setProperty("--fade-t", clamp(1 - distTop / FADE_RAMP).toFixed(3));
+      el.style.setProperty(
+        "--fade-t",
+        clamp(1 - distTop / FADE_RAMP).toFixed(3),
+      );
       el.style.setProperty(
         "--fade-b",
         clamp(1 - distBottom / FADE_RAMP).toFixed(3),
       );
+      // Sub-pixel layout can leave scrollHeight a hair over clientHeight
+      // on a list that doesn't actually scroll, so require a real gap.
+      onScrollableChange(el.scrollHeight - el.clientHeight > 1);
     };
     update();
     el.addEventListener("scroll", update, { passive: true });
@@ -157,215 +358,110 @@ export function AppSidebar() {
       el.removeEventListener("scroll", update);
       ro.disconnect();
     };
-  }, []);
+  }, [onScrollableChange]);
 
+  // `pe-0` drops the group's right padding so the scroll box reaches the
+  // panel edge. `sidebar-list-scroll` (index.css) reserves a stable 8px
+  // scrollbar gutter there, so the rows keep a constant right inset
+  // (aligned with Browse) whether or not a scrollbar shows, and the
+  // scrollbar — when it shows — sits flush at the border. Collapsed
+  // restores the rail's own 14px inset so the tiles stay centered.
   return (
-    <Sidebar
-      variant="floating"
-      collapsible="icon"
-      className="px-2 pb-2 pt-0 duration-300 ease-out [&>[data-slot=sidebar-inner]]:rounded-[10px] [&>[data-slot=sidebar-inner]]:bg-surface [&>[data-slot=sidebar-inner]]:shadow-none"
-    >
-      {/* Branding (logo + wordmark) intentionally omitted on this fork.
-       *  A slim empty header stays as top spacing so the first nav group
-       *  doesn't butt against the sidebar's rounded top edge. */}
-      <SidebarHeader className="pt-3" />
-
-      {/* The content column itself doesn't scroll: Browse stays pinned
-          (shrink-0) and only the Playlists list scrolls, so the top nav
-          never slides out of view when the library is long. */}
-      <SidebarContent className="gap-0 overflow-hidden">
-        <SidebarGroup className="shrink-0 py-1">
-          <SidebarGroupLabel>Browse</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {NAV_ITEMS.map(({ to, label, icon: Icon }) => (
-                <SidebarMenuItem key={to}>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={isOn(to)}
-                    tooltip={label}
-                    className={MENU_BTN_CLS}
-                  >
-                    <Link to={to}>
-                      <Icon />
-                      <span>{label}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        {/* `pe-0` drops the group's right padding so the scroll box
-            reaches the panel edge — `sidebar-list-scroll` (index.css)
-            reserves a stable 8px scrollbar gutter there, so the rows
-            keep a constant right inset (aligned with Browse) whether or
-            not a scrollbar shows. Collapsed restores `pe-2` for a
-            symmetric, centered rail. */}
-        <SidebarGroup className="flex min-h-0 flex-1 flex-col py-1 pe-0 group-data-[collapsible=icon]:pe-2">
-          <SidebarGroupLabel>Playlists</SidebarGroupLabel>
-          {/* The scroll lives here, not on SidebarContent, so the label
-              above stays put and only the playlist rows move.
-              `app-scroll` is the same thin scrollbar the main content
-              and carousels use. */}
-          <SidebarGroupContent
-            ref={scrollRef}
-            className="sidebar-list-fade sidebar-list-scroll app-scroll min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
-          >
-            <SidebarMenu>
-              <SidebarMenuItem>
-                <SidebarMenuButton
-                  asChild
-                  isActive={isPlaylistOn(LIKED_ID)}
-                  tooltip="Liked songs"
-                  className={MENU_BTN_CLS}
-                >
-                  <Link to="/playlist/$id" params={{ id: LIKED_ID }}>
-                    <HeartIcon className="fill-rose-500 text-rose-500" />
-                    <span>Liked songs</span>
-                  </Link>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-
-              {pinned.map((p) => (
-                <SidebarMenuItem key={p.id}>
-                  <PlaylistRowMenu
-                    id={p.id}
-                    title={p.title}
-                    thumbnailUrl={p.thumbnailUrl}
-                    pinned
-                  >
-                    <SidebarMenuButton
-                      asChild
-                      isActive={isPlaylistOn(p.id)}
-                      tooltip={p.title}
-                      className={MENU_BTN_CLS}
-                    >
-                      <Link to="/playlist/$id" params={{ id: p.id }}>
-                        {p.thumbnailUrl ? (
-                          <img
-                            src={p.thumbnailUrl}
-                            alt=""
-                            className="size-4 shrink-0 rounded-sm object-cover"
-                            loading="lazy"
-                          />
-                        ) : (
-                          <ListMusicIcon />
-                        )}
-                        <span>{p.title}</span>
-                      </Link>
-                    </SidebarMenuButton>
-                  </PlaylistRowMenu>
-                </SidebarMenuItem>
-              ))}
-
-              {libraryItems.map((it) => {
-                const thumbnailUrl = pickThumbnail(it.thumbnails, 32);
-                return (
-                  <SidebarMenuItem key={it.id}>
-                    <PlaylistRowMenu
-                      id={it.id}
-                      title={it.title}
-                      thumbnailUrl={
-                        it.thumbnails[it.thumbnails.length - 1]?.url
-                      }
-                      pinned={false}
-                    >
-                      <SidebarMenuButton
-                        asChild
-                        isActive={isPlaylistOn(it.id)}
-                        tooltip={it.title}
-                        className={MENU_BTN_CLS}
-                      >
-                        <Link to="/playlist/$id" params={{ id: it.id }}>
-                          {thumbnailUrl ? (
-                            <img
-                              src={thumbnailUrl}
-                              alt=""
-                              className="size-4 shrink-0 rounded-sm object-cover"
-                              loading="lazy"
-                            />
-                          ) : (
-                            <ListMusicIcon />
-                          )}
-                          <span>{it.title}</span>
-                        </Link>
-                      </SidebarMenuButton>
-                    </PlaylistRowMenu>
-                  </SidebarMenuItem>
-                );
-              })}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-      </SidebarContent>
-
-      <SidebarFooter>
-        <UpdateBanner />
+    <SidebarGroup className="mt-2 flex min-h-0 flex-1 flex-col py-1 pe-0 group-data-[collapsible=icon]:mt-4 group-data-[collapsible=icon]:pe-2.5">
+      <SidebarGroupLabel>Playlists</SidebarGroupLabel>
+      {/* The scroll lives here, not on SidebarContent, so the label above
+          stays put and only the playlist rows move. `app-scroll` is the
+          same thin scrollbar the main content and carousels use. */}
+      {/* `sidebar-list-scroll` (see index.css) nudges the scrollbar
+          toward the panel's right edge when expanded, and hides it while
+          keeping the icons centered when the rail is collapsed. */}
+      <SidebarGroupContent
+        ref={scrollRef}
+        className="sidebar-list-fade sidebar-list-scroll app-scroll min-h-0 flex-1 overflow-y-auto overflow-x-hidden"
+      >
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton
-              tooltip="Settings"
-              className={MENU_BTN_CLS}
-              onClick={() => openSettings()}
+              asChild
+              isActive={isPlaylistOn(LIKED_ID)}
+              tooltip="Liked songs"
+              className={ART_BTN_CLS}
             >
-              <SettingsIcon />
-              <span>Settings</span>
+              <Link to="/playlist/$id" params={{ id: LIKED_ID }}>
+                {/* Same tile geometry as a real playlist cover — see
+                    `.liked-cover` in index.css for the artwork. */}
+                <span
+                  aria-hidden
+                  data-slot="playlist-art"
+                  className="liked-cover size-5 shrink-0 rounded-[5px] outline outline-1 -outline-offset-1 outline-w140"
+                />
+                <span>Liked songs</span>
+              </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>
+
+          {rows.map((p) => (
+            <SidebarMenuItem key={p.id}>
+              <ContextMenu>
+                <ContextMenuTrigger asChild>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={isPlaylistOn(p.id)}
+                    tooltip={p.title}
+                    className={ART_BTN_CLS}
+                  >
+                    <Link to="/playlist/$id" params={{ id: p.id }}>
+                      {p.thumbnailUrl ? (
+                        <img
+                          src={p.thumbnailUrl}
+                          alt=""
+                          className="size-5 shrink-0 rounded-[5px] object-cover outline outline-1 -outline-offset-1 outline-w140"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <IconPlaylist />
+                      )}
+                      <span className="min-w-0 flex-1 truncate">{p.title}</span>
+                      {/* Subtle marker so the pinned/unpinned boundary is
+                          legible — pinning's only visible effect is the
+                          reorder, this just explains it. */}
+                      {p.pinned ? (
+                        <IconPinFilled className="size-3! shrink-0 text-t7 group-data-[collapsible=icon]:hidden" />
+                      ) : null}
+                    </Link>
+                  </SidebarMenuButton>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  {p.pinned ? (
+                    <ContextMenuItem onSelect={() => unpin(p.id)}>
+                      <IconPinnedOffFilled />
+                      Unpin from top
+                    </ContextMenuItem>
+                  ) : (
+                    <ContextMenuItem
+                      onSelect={() =>
+                        pin({
+                          id: p.id,
+                          title: p.title,
+                          thumbnailUrl: p.thumbnailUrl,
+                        })
+                      }
+                    >
+                      <IconPinFilled />
+                      Pin to top
+                    </ContextMenuItem>
+                  )}
+                  <ContextMenuItem onSelect={() => hide(p.id)}>
+                    <IconEyeOffFilled />
+                    Hide from sidebar
+                  </ContextMenuItem>
+                </ContextMenuContent>
+              </ContextMenu>
+            </SidebarMenuItem>
+          ))}
         </SidebarMenu>
-        <UserProfile />
-      </SidebarFooter>
-    </Sidebar>
-  );
-}
-
-/**
- * Right-click menu for a sidebar playlist row: pin/unpin plus hide. A
- * playlist that's currently hidden never reaches this list (filtered out
- * in AppSidebar), so there's no "unhide" branch here — that lives on the
- * Library card instead (see PlaylistPinContextMenu in shelf-card.tsx),
- * which is where a hidden playlist is still visible and reversible.
- */
-function PlaylistRowMenu({
-  id,
-  title,
-  thumbnailUrl,
-  pinned,
-  children,
-}: {
-  id: string;
-  title: string;
-  thumbnailUrl?: string;
-  pinned: boolean;
-  children: ReactNode;
-}) {
-  const pin = usePinnedPlaylistsStore((s) => s.pin);
-  const unpin = usePinnedPlaylistsStore((s) => s.unpin);
-  const hide = usePinnedPlaylistsStore((s) => s.hide);
-
-  return (
-    <ContextMenu>
-      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-      <ContextMenuContent>
-        {pinned ? (
-          <ContextMenuItem onSelect={() => unpin(id)}>
-            <PinOffIcon />
-            Unpin from top
-          </ContextMenuItem>
-        ) : (
-          <ContextMenuItem onSelect={() => pin({ id, title, thumbnailUrl })}>
-            <PinIcon />
-            Pin to top
-          </ContextMenuItem>
-        )}
-        <ContextMenuItem onSelect={() => hide(id)}>
-          <EyeOffIcon />
-          Hide from sidebar
-        </ContextMenuItem>
-      </ContextMenuContent>
-    </ContextMenu>
+      </SidebarGroupContent>
+    </SidebarGroup>
   );
 }
 
@@ -373,8 +469,7 @@ function PlaylistRowMenu({
 // Premium subscription. Kept here (not in a shared constants module)
 // because it's the only place that links out to it.
 const MANAGE_GOOGLE_URL = "https://myaccount.google.com/";
-const MANAGE_SUBSCRIPTION_URL =
-  "https://music.youtube.com/paid_memberships";
+const MANAGE_SUBSCRIPTION_URL = "https://music.youtube.com/paid_memberships";
 
 /**
  * The logged-out footer CTA: a full-width primary (brand red) button.
@@ -392,13 +487,12 @@ function SidebarSignInButton() {
               toast.error(`Sign-in failed: ${String(e)}`),
             );
           }}
-          // `flex` (not the Button's inline-flex) in collapsed mode:
-          // mx-auto only centers block-level boxes, so without it the
-          // icon button hugs the rail's left edge.
-          className="h-9 w-full gap-2 group-data-[collapsible=icon]:mx-auto group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:p-0"
+          className="grid h-9 w-full grid-cols-[32px_minmax(0,1fr)] items-center gap-0.5 overflow-hidden py-0 ps-0.5 pe-2.5 [&>svg]:justify-self-center"
         >
-          <LogInIcon />
-          <span className="group-data-[collapsible=icon]:hidden">Sign in</span>
+          <IconLogin stroke={2.3} />
+          <span data-sidebar-label className="truncate text-start">
+            Sign in
+          </span>
         </Button>
       </SidebarMenuItem>
     </SidebarMenu>
@@ -506,7 +600,6 @@ function UserProfile() {
           <DropdownMenuTrigger asChild>
             <SidebarMenuButton
               tooltip={email ? `${name} (${email})` : name}
-              className={MENU_BTN_CLS}
             >
               <Avatar className="size-4 shrink-0">
                 {photoUrl ? <AvatarImage src={photoUrl} alt={name} /> : null}
@@ -520,6 +613,7 @@ function UserProfile() {
                   "Free" about an account we can't actually see. */}
               {live ? (
                 <Badge
+                  data-sidebar-label
                   variant="outline"
                   className={cn(
                     "ms-auto h-4 px-1.5 text-[10px] font-semibold uppercase tracking-wide",
@@ -534,11 +628,7 @@ function UserProfile() {
               ) : null}
             </SidebarMenuButton>
           </DropdownMenuTrigger>
-          <DropdownMenuContent
-            side="top"
-            align="start"
-            className="min-w-64"
-          >
+          <DropdownMenuContent side="top" align="start" className="min-w-64">
             {email ? (
               <>
                 <DropdownMenuLabel className="truncate text-xs font-normal text-muted-foreground">
@@ -547,6 +637,10 @@ function UserProfile() {
                 <DropdownMenuSeparator />
               </>
             ) : null}
+            {/* Fork note: upstream's canRefresh warning (no persisted
+                browser profile) is skipped — this fork's accounts store
+                doesn't carry canRefresh yet. It will return with the
+                session-gate/auth port (35f9131). */}
             {allAccounts.length ? (
               <>
                 <DropdownMenuLabel className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -564,7 +658,7 @@ function UserProfile() {
                     // still wins on hover, which is what we want.
                     data-active={a.isActive ? "true" : undefined}
                     className={cn(
-                      "data-[active=true]:bg-accent/60 data-[active=true]:text-accent-foreground",
+                      "data-[active=true]:bg-w060 data-[active=true]:text-t1",
                     )}
                   >
                     <Avatar className="size-4 shrink-0">
@@ -589,7 +683,7 @@ function UserProfile() {
                       ) : null}
                     </div>
                     {a.isActive ? (
-                      <CheckIcon className="ms-auto text-emerald-500" />
+                      <IconCheck className="ms-auto text-acc1" />
                     ) : null}
                   </DropdownMenuItem>
                 ))}
@@ -597,28 +691,26 @@ function UserProfile() {
               </>
             ) : null}
             <DropdownMenuItem onSelect={() => openChannelPicker()}>
-              <UsersRoundIcon />
+              <IconUsersGroupFilled />
               Switch channel
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={addAccount}>
-              <UserPlusIcon />
+              <IconUserPlusFilled />
               Add another account
             </DropdownMenuItem>
             <DropdownMenuItem onSelect={openExternal(MANAGE_GOOGLE_URL)}>
-              <UserCogIcon />
+              <IconUserCogFilled />
               Manage Google Account
-              <ExternalLinkIcon className="ms-auto" />
+              <IconExternalLink className="ms-auto" />
             </DropdownMenuItem>
-            <DropdownMenuItem
-              onSelect={openExternal(MANAGE_SUBSCRIPTION_URL)}
-            >
-              <CreditCardIcon />
+            <DropdownMenuItem onSelect={openExternal(MANAGE_SUBSCRIPTION_URL)}>
+              <IconCreditCardFilled />
               Manage subscription
-              <ExternalLinkIcon className="ms-auto" />
+              <IconExternalLink className="ms-auto" />
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem variant="destructive" onSelect={signOut}>
-              <LogOutIcon />
+              <IconLogout stroke={2.3} />
               Sign out
             </DropdownMenuItem>
           </DropdownMenuContent>
