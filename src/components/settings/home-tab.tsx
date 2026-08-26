@@ -26,7 +26,7 @@ export function HomeTab() {
   const [dragOver, setDragOver] = useState<number | null>(null);
 
   return (
-    <TabPane tightTop>
+    <TabPane>
       <Group>
         <SettingRow
           icon={HomeIcon}

@@ -52,7 +52,7 @@ export function IntegrationsTab() {
 
   if (active === "lastfm") {
     return (
-      <TabPane tightTop>
+      <TabPane>
         <BackRow label="Last.fm" onBack={() => setActive(null)} />
         <LastfmGroup />
       </TabPane>
@@ -60,7 +60,7 @@ export function IntegrationsTab() {
   }
   if (active === "discord") {
     return (
-      <TabPane tightTop>
+      <TabPane>
         <BackRow label="Discord Rich Presence" onBack={() => setActive(null)} />
         <DiscordGroup />
       </TabPane>
@@ -68,7 +68,7 @@ export function IntegrationsTab() {
   }
 
   return (
-    <TabPane tightTop>
+    <TabPane>
       <IntegrationListRow
         icon={Music2Icon}
         title="Last.fm"
