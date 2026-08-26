@@ -1,3 +1,6 @@
+// Transport glyphs (play / pause / prev / next) stay on Lucide — they
+// read better filled at this size than the Tabler equivalents. The
+// footer row is Tabler, per the design.
 import {
   PlayIcon,
   PauseIcon,
@@ -6,12 +9,16 @@ import {
   ShuffleIcon,
   RepeatIcon,
   Repeat1Icon,
-  VolumeIcon,
-  Volume1Icon,
-  Volume2Icon,
-  VolumeXIcon,
   Loader2Icon,
 } from "lucide-react";
+import {
+  IconVolumeFilled,
+  IconVolume2Filled,
+  IconVolume3Filled,
+} from "@/components/shared/filled-icons";
+// Fork note: IconLoader2/IconVideoFilled/IconMusicFilled from upstream's
+// SourceToggle restyle are omitted — SourceToggle itself is omitted (see
+// below); the song/video picker lives in the player menu.
 import { QueueBody, QueueToggleButton } from "@/components/layout/queue-panel";
 import {
   LyricsBody,
@@ -36,8 +43,12 @@ import {
 import { LikeDislikeButtons } from "@/components/shared/like-buttons";
 import { ArtistLinks } from "@/components/shared/artist-links";
 import { AlbumLink } from "@/components/shared/album-link";
+import { EntityLink } from "@/components/shared/entity-link";
 import { PlayerMoreMenu } from "@/components/layout/player-more-menu";
 import { PlayerCoverMenu } from "@/components/layout/player-cover-menu";
+import {
+  playerIconButton,
+} from "@/components/layout/player-chrome";
 import { cn } from "@/lib/utils";
 import { usePlayerCoverDrag } from "@/lib/player-drag";
 import { openCoverLightbox } from "@/lib/store/cover-lightbox";
@@ -100,6 +111,9 @@ export function repeatLabel(repeat: RepeatMode): string {
       : "Repeat off";
 }
 
+/* Fork note: SourceToggle intentionally omitted — fork moved the
+   song/video picker into the player menu (0209432). Upstream's
+   restyled toggle from 77b2c44 is skipped to preserve that decision. */
 export function ProgressSlider({
   position,
   duration,
@@ -186,14 +200,14 @@ export function VolumeControl({
   const toggleMute = usePlaybackStore((s) => s.toggleMute);
   const [open, setOpen] = useState(false);
 
+  // Tabler ships three speaker states to Lucide's four, so the old
+  // "audible but no waves" step folds into the single-wave icon.
   const Icon =
     muted || volume === 0
-      ? VolumeXIcon
-      : volume <= 0.15
-        ? VolumeIcon
-        : volume < 0.6
-          ? Volume1Icon
-          : Volume2Icon;
+      ? IconVolume3Filled
+      : volume < 0.6
+        ? IconVolume2Filled
+        : IconVolumeFilled;
   const pct = muted ? 0 : Math.round(volume * 100);
 
   // Horizontal: slider sits to the right of the speaker icon (right
@@ -246,11 +260,11 @@ export function VolumeControl({
         size="icon"
         aria-label={muted ? "Unmute" : "Mute"}
         onClick={toggleMute}
-        className="shrink-0"
+        className={playerIconButton}
       >
         <AnimatePresence mode="popLayout" initial={false}>
           <motion.span
-            key={Icon.displayName ?? Icon.name}
+            key={Icon.name}
             initial={{ opacity: 0, scale: 0.7 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.7 }}
@@ -466,18 +480,40 @@ export function PlayerBar({
           </div>
         </PlayerCoverMenu>
 
-        {/* Title + artist with heart on the right */}
-        <div className="flex items-start gap-2">
+        {/* Title + artist/album with heart on the right. The heart
+            centres against the whole two-line block, per the design. */}
+        <div className="flex items-center gap-2">
           <div className="flex min-w-0 flex-1 flex-col">
             <span className="truncate text-base font-medium">
               {track?.title ?? "Nothing playing"}
             </span>
             {track ? (
-              <ArtistLinks
-                artists={track.artists}
-                fallback={track.subtitle ?? ""}
-                className="truncate text-sm text-muted-foreground"
-              />
+              <span className="truncate text-sm text-muted-foreground">
+                <ArtistLinks
+                  artists={track.artists}
+                  fallback={track.subtitle ?? ""}
+                />
+                {/* The separator only earns its place between two real
+                    halves — a track with no artists must not open with
+                    a stray dot. The album links through only when the
+                    row it came from carried a browse id. */}
+                {track.album ? (
+                  <>
+                    {track.artists?.length || track.subtitle ? " · " : null}
+                    {track.albumId ? (
+                      <EntityLink
+                        to="/album/$id"
+                        id={track.albumId}
+                        event="nav:album"
+                      >
+                        {track.album}
+                      </EntityLink>
+                    ) : (
+                      track.album
+                    )}
+                  </>
+                ) : null}
+              </span>
             ) : (
               <span className="truncate text-sm text-muted-foreground">
                 Pick a track to start
@@ -495,7 +531,7 @@ export function PlayerBar({
             <LikeDislikeButtons
               videoId={track.videoId}
               meta={track}
-              className="-mt-1"
+              className="shrink-0"
             />
           ) : null}
         </div>

@@ -6,10 +6,9 @@ import {
   ShuffleIcon,
   RepeatIcon,
   Repeat1Icon,
-  Loader2Icon,
-  MicVocalIcon,
 } from "lucide-react";
 import { useRef } from "react";
+import { IconLoader2, IconMicrophoneFilled } from "@tabler/icons-react";
 import { useShallow } from "zustand/react/shallow";
 import {
   Popover,
@@ -214,7 +213,7 @@ export function PlayerBarBottom() {
             className="size-12 rounded-full bg-brand text-white hover:bg-brand/90"
           >
             {loading ? (
-              <Loader2Icon className="animate-spin" />
+              <IconLoader2 className="animate-spin" />
             ) : playing ? (
               <PauseIcon className="size-5 fill-current" />
             ) : (
@@ -295,7 +294,7 @@ function LyricsPopover({
   if (!state.hasTrack) {
     return (
       <Button variant="ghost" size="icon" disabled aria-label="Lyrics">
-        <MicVocalIcon />
+        <IconMicrophoneFilled />
       </Button>
     );
   }
@@ -305,7 +304,7 @@ function LyricsPopover({
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <Button variant="ghost" size="icon" aria-label="Lyrics">
-              <MicVocalIcon />
+              <IconMicrophoneFilled />
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>

@@ -1,5 +1,11 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { MicVocalIcon, RotateCwIcon } from "lucide-react";
+import { IconRefresh } from "@tabler/icons-react";
+import { IconMicrophoneFilled } from "@tabler/icons-react";
+import { playerIconButton } from "@/components/layout/player-chrome";
+// Fork note: IconCheck from upstream's menu restyle is omitted for now —
+// this port keeps fork's lyrics on/off toggle + radio group. It will return
+// with the shared menu-chrome port (869f271). RotateCw/MicVocal (Lucide)
+// were replaced by Tabler IconRefresh/IconMicrophoneFilled in this port.
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -170,7 +176,7 @@ export function LyricsBody({ state }: { state: LyricsViewState }) {
             onClick={state.retryFailed}
             disabled={state.isRetrying}
           >
-            <RotateCwIcon className={state.isRetrying ? "animate-spin" : ""} />
+            <IconRefresh className={state.isRetrying ? "animate-spin" : ""} />
             {state.isRetrying ? "Trying…" : "Try again"}
           </Button>
         </div>
@@ -514,9 +520,9 @@ export function LyricsSourceButton({
               variant="ghost"
               size="icon"
               aria-label="Lyrics source"
-              className={className}
+              className={cn(playerIconButton, className)}
             >
-              <MicVocalIcon />
+              <IconMicrophoneFilled />
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
