@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useInfiniteQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef } from "react";
 import { fetchHomeFeedPage } from "@/lib/innertube/home";
 import { ShelfCarousel } from "@/components/shared/shelf-carousel";
@@ -31,11 +31,11 @@ function sortShelvesByOrder(shelves: Shelf[], order: string[]): Shelf[] {
 }
 
 function HomePage() {
+  const qc = useQueryClient();
   const {
     data,
     isLoading,
     error,
-    refetch,
     isFetching,
     fetchNextPage,
     hasNextPage,
@@ -71,17 +71,25 @@ function HomePage() {
     [shelves, order, customized],
   );
 
+  // Reset back to a fresh first page. A plain refetch replays every
+  // loaded page's cursor, including continuation tokens rehydrated from
+  // the persisted cache — once YouTube rejects one (HTTP 400 on a stale
+  // token) it rejects it forever, so refetch/Retry could never recover.
+  // Resetting drops the dead cursors and reloads page 1 for new ones.
+  const resetFeed = () =>
+    void qc.resetQueries({ queryKey: ["home", "v2"] });
+
   // Manual refresh: pull a fresh home feed (recommendations rotate on
   // YT's side) and jump back to the top so the user lands on the new
-  // top shelves. `refetch` re-runs every loaded page, so the whole feed
-  // updates in place rather than just page one.
+  // top shelves. Reset (not refetch) so stale persisted cursors are
+  // dropped rather than replayed — see resetFeed above.
   const refreshing = isFetching && !isFetchingNextPage;
   const handleRefresh = () => {
     if (refreshing) return;
     document
       .querySelector<HTMLElement>("main.app-scroll")
       ?.scrollTo({ top: 0, behavior: "smooth" });
-    void refetch();
+    resetFeed();
   };
 
   // With a custom order applied, fetch every page up front instead of
@@ -137,7 +145,7 @@ function HomePage() {
         </button>
       </div>
 
-      {error ? (
+      {error && shelves.length === 0 ? (
         <div className="flex items-start gap-3 rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm">
           <AlertCircleIcon className="size-5 shrink-0 text-destructive" />
           <div className="flex flex-col gap-1">
@@ -147,7 +155,7 @@ function HomePage() {
             </span>
             <button
               type="button"
-              onClick={() => refetch()}
+              onClick={resetFeed}
               className="mt-1 w-fit text-brand hover:underline"
             >
               Retry
@@ -163,6 +171,20 @@ function HomePage() {
             <ShelfCarousel key={shelf.id} shelf={shelf} />
           ))
         : null}
+
+      {error && shelves.length > 0 ? (
+        <div className="flex items-center justify-center gap-2 text-sm text-muted-foreground">
+          <AlertCircleIcon className="size-4 shrink-0 text-destructive" />
+          <span>Couldn't load more — {(error as Error).message}</span>
+          <button
+            type="button"
+            onClick={resetFeed}
+            className="text-brand hover:underline"
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
 
       {hasNextPage && !customized ? (
         <div
