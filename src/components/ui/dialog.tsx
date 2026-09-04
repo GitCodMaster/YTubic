@@ -49,8 +49,9 @@ function DialogOverlay({
         // the app while a dialog is up, and should read that way. The
         // minimize / maximize / close cluster is the exception: it lifts
         // itself above this (see `WINDOW_CHROME_ATTR` below).
-        // (Fork note: same full-window cover as fork's ac9c70b fix.)
-        "fixed inset-0 z-50 bg-black/50 backdrop-blur-xs data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0",
+        // (Fork note: same full-window cover as fork's ac9c70b fix;
+        // light-theme scrim from upstream 5b0deeb.)
+        "fixed inset-0 z-50 bg-scrim dark:bg-black/50 backdrop-blur-xs data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0",
         className
       )}
       {...props}
