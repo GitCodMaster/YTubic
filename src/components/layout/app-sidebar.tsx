@@ -352,12 +352,12 @@ function PlaylistRowMenu({
         {pinned ? (
           <ContextMenuItem onSelect={() => unpin(id)}>
             <PinOffIcon />
-            Unpin from sidebar
+            Unpin from top
           </ContextMenuItem>
         ) : (
           <ContextMenuItem onSelect={() => pin({ id, title, thumbnailUrl })}>
             <PinIcon />
-            Pin to sidebar
+            Pin to top
           </ContextMenuItem>
         )}
         <ContextMenuItem onSelect={() => hide(id)}>

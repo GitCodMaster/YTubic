@@ -6,8 +6,6 @@ import {
   ArrowDownAZIcon,
   CheckIcon,
   Loader2Icon,
-  PinIcon,
-  PinOffIcon,
   SearchIcon,
   Share2Icon,
   XIcon,
@@ -39,10 +37,6 @@ import {
 import { usePlaybackStore } from "@/lib/store/playback";
 import { copyLink } from "@/lib/clipboard";
 import { universalShareUrl } from "@/lib/deep-link";
-import {
-  useIsPinned,
-  usePinnedPlaylistsStore,
-} from "@/lib/store/pinned-playlists";
 import {
   usePlaylistSortStore,
   type PlaylistSortMode,
@@ -87,9 +81,6 @@ function PlaylistPageView() {
     getNextPageParam: (lastPage) => lastPage.continuationToken,
   });
 
-  const pinned = useIsPinned(id);
-  const pin = usePinnedPlaylistsStore((s) => s.pin);
-  const unpin = usePinnedPlaylistsStore((s) => s.unpin);
   const isLikedSongs = id === "LM" || id === "VLLM";
 
   const sortMode = usePlaylistSortStore(
@@ -272,30 +263,8 @@ function PlaylistPageView() {
           openedFromArtist ? undefined : () => void shufflePlaylist()
         }
         actions={
-          isArtistTopSongs ||
-          openedFromArtist ? null : isLikedSongs ? null : (
+          isArtistTopSongs || openedFromArtist ? null : isLikedSongs ? null : (
             <>
-              {pinned ? (
-                <Button variant="outline" onClick={() => unpin(id)}>
-                  <PinOffIcon />
-                  Unpin
-                </Button>
-              ) : (
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    pin({
-                      id,
-                      title: header.title,
-                      thumbnailUrl:
-                        header.thumbnails[header.thumbnails.length - 1]?.url,
-                    })
-                  }
-                >
-                  <PinIcon />
-                  Pin to sidebar
-                </Button>
-              )}
               {/* One link for everyone: the share page opens the playlist in
                   YTubic when it's installed and falls back to YouTube Music
                   when it isn't. The YTM fallback wants the bare list id, so

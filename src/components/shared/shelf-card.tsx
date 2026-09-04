@@ -390,7 +390,7 @@ function PlaylistPinContextMenu({
         {pinned ? (
           <ContextMenuItem onSelect={() => unpin(item.id)}>
             <PinOffIcon />
-            Unpin from sidebar
+            Unpin from top
           </ContextMenuItem>
         ) : (
           <ContextMenuItem
@@ -404,7 +404,7 @@ function PlaylistPinContextMenu({
             }
           >
             <PinIcon />
-            Pin to sidebar
+            Pin to top
           </ContextMenuItem>
         )}
         {hidden ? (
