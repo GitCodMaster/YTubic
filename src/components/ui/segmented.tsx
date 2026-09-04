@@ -11,7 +11,7 @@ const SPRING = {
 
 export interface SegmentedOption<T extends string> {
   value: T;
-  label: string;
+  label: React.ReactNode;
 }
 
 /**
