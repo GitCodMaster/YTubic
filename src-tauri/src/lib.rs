@@ -3483,9 +3483,13 @@ pub fn run() {
     let cache_limit_handle = state.cache_limit.clone();
 
     tauri::Builder::default()
+        // The `deep-link` feature forwards the second instance's argv
+        // (a `ytubic://` URL) to the deep-link plugin, so the running app
+        // receives it as a `deep-link://new-url` event.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             show_main_window(app);
         }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(
             // Default StateFlags includes DECORATIONS, which would
             // override our `decorations: false` from tauri.conf.json
@@ -3632,6 +3636,15 @@ pub fn run() {
             // thread, which souvlaki requires and where the main window's
             // HWND is available.
             media::init(app.handle());
+            // The NSIS installer registers `ytubic://` for release builds;
+            // dev runs and Linux need the runtime registration.
+            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    eprintln!("[deep-link] register failed: {e}");
+                }
+            }
             if let Err(e) = build_tray(app.handle()) {
                 eprintln!("[tray] build failed: {e}");
             }
