@@ -19,6 +19,8 @@ import {
 import { fetchShuffleQueue } from "@/lib/innertube/radio";
 import type { ShelfItem } from "@/lib/innertube/types";
 import { EntityHeader } from "@/components/shared/entity-header";
+import { LikedCover } from "@/components/shared/liked-cover";
+import { LikedCoverPicker } from "@/components/shared/liked-cover-picker";
 import { ExpandableText } from "@/components/shared/expandable-text";
 import { TrackList } from "@/components/shared/track-list";
 import { JumpToCurrentButton } from "@/components/shared/jump-to-current-button";
@@ -246,6 +248,14 @@ function PlaylistPageView() {
           (isArtistTopSongs || openedFromArtist) && img
             ? [{ url: img, width: 512, height: 512 }]
             : header.thumbnails
+        }
+        cover={
+          isLikedSongs ? (
+            <>
+              <LikedCover className="size-full rounded-[inherit] shadow-lg" />
+              <LikedCoverPicker />
+            </>
+          ) : undefined
         }
         round={isArtistTopSongs || openedFromArtist}
         keepSubtitleInCompact={isArtistTopSongs || openedFromArtist}
