@@ -4,23 +4,11 @@ import { HeartIcon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { fetchLikedSongs } from "@/lib/innertube/library";
-import { likeTrack, removeRating } from "@/lib/innertube/mutations";
-import { syncLastfmLove } from "@/lib/lastfm/love";
+import { toggleLiked } from "@/lib/like-actions";
 import type { LastfmTrackMeta } from "@/lib/lastfm/track";
 import { useTrackMetaStore } from "@/lib/store/track-meta";
 import type { ShelfItem } from "@/lib/innertube/types";
 import { cn } from "@/lib/utils";
-
-// Patch the cached liked-songs list optimistically. The server is the
-// source of truth, but `["liked-songs"]` is `enabled: false` in this
-// component (and in the context menu) so an `invalidateQueries` call
-// would NOT refetch — meaning the heart wouldn't fill until the user
-// visited Settings or the Liked Songs page. Mutating the cache
-// directly keeps every observer (player bar, track rows, context
-// menus, settings cache list) in sync without a network round-trip.
-function makeLikedPlaceholder(videoId: string): ShelfItem {
-  return { id: videoId, kind: "song", title: "", thumbnails: [] };
-}
 
 // Module-level memo of the liked-id Set. With ~5k liked tracks and ~100
 // LikeDislikeButtons on a single page, doing `(liked.data ?? []).some(...)`
@@ -86,39 +74,14 @@ export function LikeDislikeButtons({
     setBusy("like");
     const wasLiked = isLiked;
     try {
-      if (wasLiked) {
-        await removeRating(videoId);
-        qc.setQueryData<ShelfItem[]>(["liked-songs"], (old) =>
-          (old ?? []).filter((t) => t.id !== videoId),
-        );
-        toast.success("Removed from Liked");
-      } else {
-        await likeTrack(videoId);
-        qc.setQueryData<ShelfItem[]>(["liked-songs"], (old) => {
-          const list = old ?? [];
-          if (list.some((t) => t.id === videoId)) return list;
-          return [makeLikedPlaceholder(videoId), ...list];
-        });
-        toast.success("Added to Liked");
-      }
       // Mirror to Last.fm loved tracks. Prefer caller-supplied metadata;
       // fall back to what we remembered at play time (both may be absent
       // for a never-played track, in which case love-sync quietly skips).
-      syncLastfmLove(
-        meta ?? useTrackMetaStore.getState().byId[videoId] ?? {},
-        !wasLiked,
-      );
-      // The heart-fill cache (["liked-songs"]) is separate from the
-      // Library → Songs list (["library","liked-songs-pages"]) and the
-      // Liked Songs (LM) playlist page (["playlist-pages", …"LM"…]). Mark
-      // those stale so they don't keep showing an outdated list. They're
-      // heavy infinite queries, so invalidate only refetches if mounted.
-      void qc.invalidateQueries({ queryKey: ["library", "liked-songs-pages"] });
-      void qc.invalidateQueries({
-        predicate: (q) =>
-          q.queryKey[0] === "playlist-pages" &&
-          typeof q.queryKey[1] === "string" &&
-          (q.queryKey[1] as string).includes("LM"),
+      await toggleLiked({
+        queryClient: qc,
+        videoId,
+        wasLiked,
+        track: meta ?? useTrackMetaStore.getState().byId[videoId],
       });
     } catch (err) {
       toast.error(String(err));
