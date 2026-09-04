@@ -15,6 +15,7 @@ import {
 } from "@/lib/store/track-source";
 import { pickThumbnail } from "@/components/shared/thumbnail";
 import { rememberTrack } from "@/lib/store/track-meta";
+import { IS_MAC } from "@/lib/platform";
 import {
   loadPlaybackPosition,
   savePlaybackPosition,
@@ -23,11 +24,15 @@ import { useDiscordStore, isDiscordConfigured } from "@/lib/store/discord";
 
 /**
  * AudioEngine binds the playback store to a singleton HTMLAudioElement
- * and drives the OS media controls (Windows SMTC / Linux MPRIS) from Rust
- * via souvlaki (see the media effects below and src-tauri/src/media.rs)
- * rather than the webview's own media session — that one either shows up
- * as "Unknown app" (Windows, WebView2 child process) or doesn't bridge to
- * the desktop at all (Linux, WebKitGTK).
+ * and drives the native media controls.
+ *
+ * On Windows and Linux that happens from Rust via souvlaki (SMTC / MPRIS; see
+ * src-tauri/src/media.rs), and the webview's own media session stays disabled
+ * because it belongs to the WebView2 child process and appears as an "Unknown
+ * app" duplicate. macOS is the exact opposite: WKWebView's media session is the
+ * host process's own and always wins the media keys, so we feed it directly
+ * through `navigator.mediaSession` and skip souvlaki entirely — without that, a
+ * bare <audio> element leaves next/previous unhandled and the keys do nothing.
  *
  * Mount this hook once, near the root. It owns the <audio> element's lifecycle.
  */
@@ -385,6 +390,31 @@ export function useAudioEngine() {
   // / state is pushed by the media_update effect lower down; buttons come
   // back via the media-control listener below. See src-tauri/src/media.rs.
 
+  // macOS only: WKWebView owns the Now Playing session (see the hook comment),
+  // and the play/pause key already works because WebKit pauses the element
+  // itself — but that also means it flips `el.paused` behind the store's back,
+  // so the handlers below exist to keep the store authoritative and to supply
+  // the next/previous/seek commands a bare <audio> session simply doesn't have.
+  useEffect(() => {
+    if (!IS_MAC || !("mediaSession" in navigator)) return;
+    const ms = navigator.mediaSession;
+    const store = usePlaybackStore.getState;
+    ms.setActionHandler("play", () => store().setPlaying(true));
+    ms.setActionHandler("pause", () => store().setPlaying(false));
+    ms.setActionHandler("nexttrack", () => store().next());
+    ms.setActionHandler("previoustrack", () => store().prev());
+    ms.setActionHandler("seekto", (d) => {
+      if (typeof d.seekTime === "number") store().seek(d.seekTime);
+    });
+    return () => {
+      ms.setActionHandler("play", null);
+      ms.setActionHandler("pause", null);
+      ms.setActionHandler("nexttrack", null);
+      ms.setActionHandler("previoustrack", null);
+      ms.setActionHandler("seekto", null);
+    };
+  }, []);
+
   // Tray menu commands come via a Tauri event. `cancelled` flag
   // protects against StrictMode's mount→unmount→mount race that
   // would otherwise leak duplicate listeners and double-call
@@ -597,8 +627,78 @@ export function useAudioEngine() {
   // this sync never re-triggers the resolve / playback effects above.
   const duration = usePlaybackStore((s) => s.duration);
   const discordSettings = useDiscordStore();
+  // Signature of the metadata last handed to navigator.mediaSession. Re-setting
+  // `ms.metadata` makes WebKit re-fetch the artwork URL, so the 2s position
+  // refresh must not rebuild it — mirrors the LAST_META guard in media.rs.
+  const lastMacMetaRef = useRef<string | null>(null);
   useEffect(() => {
+    // macOS: same cadence, but written to the session the OS actually listens
+    // to (see the hook comment) rather than round-tripped through souvlaki.
+    const pushMac = () => {
+      const ms = navigator.mediaSession;
+      const s = usePlaybackStore.getState();
+      const t = s.index >= 0 ? s.queue[s.index] : undefined;
+      if (!t) {
+        lastMacMetaRef.current = null;
+        ms.metadata = null;
+        try {
+          (ms as { playbackState?: string }).playbackState = "none";
+        } catch {
+          /* older WebKit without playbackState */
+        }
+        return;
+      }
+      const artist = buildArtistLabel(t);
+      const album = t.album ?? "";
+      const cover = pickThumbnail(t.thumbnails, 512) ?? "";
+      const sig = `${t.title} ${artist} ${album} ${cover}`;
+      if (lastMacMetaRef.current !== sig) {
+        lastMacMetaRef.current = sig;
+        try {
+          ms.metadata = new MediaMetadata({
+            title: t.title,
+            artist,
+            album,
+            artwork: cover ? [{ src: cover, sizes: "512x512" }] : [],
+          });
+        } catch {
+          /* mediaSession metadata unsupported */
+        }
+      }
+      try {
+        (ms as { playbackState?: string }).playbackState = s.playing
+          ? "playing"
+          : "paused";
+      } catch {
+        /* ignore */
+      }
+      const dur = Number.isFinite(s.duration) ? s.duration : 0;
+      // setPositionState rejects a position past the duration, and a 0/absent
+      // duration outright — both happen briefly while a track is resolving.
+      if (dur > 0) {
+        try {
+          ms.setPositionState({
+            duration: dur,
+            position: Math.min(Math.max(s.position, 0), dur),
+            playbackRate: 1,
+          });
+        } catch {
+          /* position unknown yet */
+        }
+      }
+    };
     const push = () => {
+      if (IS_MAC && "mediaSession" in navigator) {
+        pushMac();
+        const s = usePlaybackStore.getState();
+        const t = s.index >= 0 ? s.queue[s.index] : undefined;
+        if (!t) {
+          void invoke("discord_clear").catch(() => {});
+          return;
+        }
+        pushDiscordPresence(t, s, discordSettings);
+        return;
+      }
       const s = usePlaybackStore.getState();
       const t = s.index >= 0 ? s.queue[s.index] : undefined;
       if (!t) {
