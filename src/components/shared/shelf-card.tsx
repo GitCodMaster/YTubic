@@ -43,6 +43,7 @@ import { ArtworkOutline } from "@/components/shared/artwork-outline";
 import { Thumbnail } from "@/components/shared/thumbnail";
 import { ArtistLinks } from "@/components/shared/artist-links";
 import { TrackContextMenu } from "@/components/shared/track-context-menu";
+import { AlbumContextMenu } from "@/components/shared/album-menu";
 import { usePlaybackStore } from "@/lib/store/playback";
 import {
   useIsHidden,
@@ -316,15 +317,17 @@ export function ShelfCard({ item, className }: Props) {
 
   if (item.kind === "album") {
     return (
-      <div className={cn(CARD_CLASS, "relative", className)}>
-        <Link
-          to="/album/$id"
-          params={{ id: item.id }}
-          aria-label={item.title}
-          className={overlayClass}
-        />
-        {body}
-      </div>
+      <AlbumContextMenu albumId={item.id}>
+        <div className={cn(CARD_CLASS, "relative", className)}>
+          <Link
+            to="/album/$id"
+            params={{ id: item.id }}
+            aria-label={item.title}
+            className={overlayClass}
+          />
+          {body}
+        </div>
+      </AlbumContextMenu>
     );
   }
 
