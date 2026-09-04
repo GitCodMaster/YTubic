@@ -1,3 +1,4 @@
+import { useRef } from "react";
 import {
   PlayIcon,
   PauseIcon,
@@ -7,7 +8,6 @@ import {
   RepeatIcon,
   Repeat1Icon,
 } from "lucide-react";
-import { useRef } from "react";
 import { IconLoader2, IconMicrophoneFilled } from "@tabler/icons-react";
 import { useShallow } from "zustand/react/shallow";
 import {
@@ -139,6 +139,11 @@ export function PlayerBarBottom() {
             instead of pushing the transport cluster off-center. */}
         <div className="flex min-w-0 flex-1 items-center gap-3">
           <PlayerCoverMenu track={track}>
+            {/* A plain click on the cover opens the full-screen view; a
+                drag (the layout switch) must not. The drag handle keeps
+                pointer capture, so `click` still fires after a drag and
+                the pointer's travel since pointerdown is what tells the
+                two apart. */}
             <div
               ref={coverRef}
               onPointerDown={onCoverPointerDown}

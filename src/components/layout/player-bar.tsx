@@ -11,6 +11,7 @@ import {
   Repeat1Icon,
   Loader2Icon,
 } from "lucide-react";
+import { IconArrowsMaximize } from "@tabler/icons-react";
 import {
   IconVolumeFilled,
   IconVolume2Filled,
@@ -41,6 +42,7 @@ import {
   getRenderedThumbnailSrc,
 } from "@/components/shared/thumbnail";
 import { LikeDislikeButtons } from "@/components/shared/like-buttons";
+import { ArtworkOutline } from "@/components/shared/artwork-outline";
 import { ArtistLinks } from "@/components/shared/artist-links";
 import { AlbumLink } from "@/components/shared/album-link";
 import { EntityLink } from "@/components/shared/entity-link";
@@ -52,6 +54,7 @@ import {
 import { cn } from "@/lib/utils";
 import { usePlayerCoverDrag } from "@/lib/player-drag";
 import { openCoverLightbox } from "@/lib/store/cover-lightbox";
+import { openFullscreen } from "@/lib/store/fullscreen";
 import { usePlaybackStore, currentTrack } from "@/lib/store/playback";
 import { usePanelsStore } from "@/lib/store/panels";
 import { useScrubStore } from "@/lib/store/scrub";
@@ -190,8 +193,11 @@ export function ProgressSlider({
 
 export function VolumeControl({
   direction = "horizontal",
+  className,
 }: {
   direction?: "horizontal" | "vertical";
+  /** Extra classes for the speaker button (the full-screen chip). */
+  className?: string;
 }) {
   const { volume, muted } = usePlaybackStore(
     useShallow((s) => ({ volume: s.volume, muted: s.muted })),
@@ -260,7 +266,7 @@ export function VolumeControl({
         size="icon"
         aria-label={muted ? "Unmute" : "Mute"}
         onClick={toggleMute}
-        className={playerIconButton}
+        className={cn(playerIconButton, className)}
       >
         <AnimatePresence mode="popLayout" initial={false}>
           <motion.span
@@ -466,14 +472,44 @@ export function PlayerBar({
             )}
           >
             {track ? (
-              <Thumbnail
-                thumbnails={track.thumbnails}
-                alt={track.title}
-                className="aspect-square w-full rounded-md border border-hairline pointer-events-none"
-                targetSize={1024}
-                highRes
-                overrideHighRes={iTunesCover}
-              />
+              // The wrapper carries the shadow so it is cast by the cover's
+              // rounded box rather than by the Thumbnail's own square edge.
+              //
+              // `isolate` is load-bearing: the outline below blends, and a
+              // blending element turns its nearest stacking-context ancestor
+              // into an isolated group, which is also a backdrop root. Without
+              // it that group is the motion.div wrapping cover AND lyrics, so
+              // the lyrics' backdrop-blur strip loses the card and the app
+              // background from its backdrop and paints as a dark band.
+              <div className="group/cover relative isolate aspect-square w-full rounded-md shadow-[0_1px_14px_rgb(0_0_0/0.12)]">
+                <Thumbnail
+                  thumbnails={track.thumbnails}
+                  alt={track.title}
+                  className="size-full rounded-md pointer-events-none"
+                  targetSize={1024}
+                  highRes
+                  overrideHighRes={iTunesCover}
+                />
+                <ArtworkOutline className="rounded-md" />
+                {/* Hover pad with the Full screen chip, per the design.
+                    Only the chip is clickable, and it stops the pointer
+                    from reaching the cover's drag handle: the handle
+                    captures the pointer, which would swallow the click.
+                    The floating window has its own surface for this. */}
+                {variant !== "floating" ? (
+                  <div className="pointer-events-none absolute inset-0 grid place-items-center rounded-md bg-(--g6a) opacity-0 transition-opacity duration-[160ms] group-hover/cover:opacity-100 has-[button:focus-visible]:opacity-100">
+                    <button
+                      type="button"
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={openFullscreen}
+                      className="pointer-events-auto flex cursor-pointer items-center gap-2 rounded-[10px] bg-w160 px-3.5 py-[9px] text-[13px] font-semibold text-white backdrop-blur-[8px] transition-colors hover:bg-w200"
+                    >
+                      <IconArrowsMaximize className="size-[17px]" stroke={1.9} />
+                      Full screen
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             ) : (
               <div className="aspect-square w-full rounded-md border border-hairline bg-muted" />
             )}
