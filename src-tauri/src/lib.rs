@@ -1007,7 +1007,8 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
         eprintln!("[login] mkdir webview-data: {e}");
     }
 
-    let url = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fmusic.youtube.com%2F"
+    const SERVICE_LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fmusic.youtube.com%2F";
+    let url = SERVICE_LOGIN_URL
         .parse::<tauri::Url>()
         .map_err(|e| e.to_string())?;
 
@@ -1075,8 +1076,13 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                 //      hint. The user is stuck on a Google settings
                 //      page and YT never gets a chance to handshake.
                 //
-                // For case (2), force-navigate to music.youtube.com
-                // when the current page host is myaccount.google.com.
+                // For case (2), replay the ServiceLogin URL when the current
+                // page host is myaccount.google.com. With a live Google
+                // session, Google's own redirect chain bridges the
+                // .google.com cookies into the .youtube.com cookies that
+                // InnerTube needs; navigating straight to music.youtube.com
+                // relied on YT's client-side auto-sign-in, which completed
+                // only about half the time and left a bare page.
                 // Do NOT force-navigate while the natural continue
                 // redirect to YT is in flight — cancelling it breaks
                 // the YT auto-sign-in handshake.
@@ -1110,13 +1116,10 @@ async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
                             }))
                             .unwrap_or(false);
                         if parked {
-                            if let Ok(url) =
-                                "https://music.youtube.com/"
-                                    .parse::<tauri::Url>()
-                            {
+                            if let Ok(url) = SERVICE_LOGIN_URL.parse::<tauri::Url>() {
                                 match win.navigate(url) {
                                     Ok(()) => eprintln!(
-                                        "[login] google-auth detected on parked page; redirected to music.youtube.com"
+                                        "[login] google-auth detected on parked page; replayed ServiceLogin so Google bridges the youtube.com cookies itself"
                                     ),
                                     Err(e) => eprintln!(
                                         "[login] failed to redirect to YT: {e}"
