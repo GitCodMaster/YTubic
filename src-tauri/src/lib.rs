@@ -27,6 +27,11 @@ use tower_http::services::ServeFile;
 mod appid;
 mod discord;
 mod media;
+// Grants the microphone to our own pages without WebView2's dialog; the
+// Playback tab needs it to name and pick output devices. Ported from
+// upstream 8cdb647.
+#[cfg(windows)]
+mod webview_permissions;
 mod ytdlp;
 
 /// Write `bytes` to `path` atomically: a sibling temp file, flushed to
@@ -3665,6 +3670,12 @@ pub fn run() {
                         settings.set_enable_smooth_scrolling(true);
                     }
                 });
+            }
+            // Ported from upstream 8cdb647: grant mic to own pages without
+            // WebView2 dialog (Playback tab needs it for output devices).
+            #[cfg(windows)]
+            if let Some(w) = app.get_webview_window("main") {
+                webview_permissions::install(&w);
             }
             // Debug builds swap the taskbar/window icon to the orange
             // dev variant (see runtime_icon) so a dev instance is

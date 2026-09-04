@@ -1,6 +1,6 @@
 [package]
 name = "ytubic"
-version = "0.10.0"
+version = "0.4.7"
 description = "YTubic — fast, responsive YouTube Music desktop client"
 authors = ["George Shyshov"]
 license = "GPL-3.0-only"
@@ -51,7 +51,6 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 tower = "0.5"
 cookie = "0.18"
 time = "0.3"
-base64 = "0.22"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
 tauri-plugin-autostart = "2"
@@ -65,7 +64,7 @@ souvlaki = "0.7"
 # socket / named pipe (no native deps beyond that). Off by default; opt-in
 # from Settings. See src/discord.rs. Set YTUBIC_DISCORD_APP_ID at build time
 # (or edit APP_ID) to the Application ID of a Discord app named "YTubic".
-discord-rich-presence = "1.1.0"
+discord-rich-presence = "0.2"
 # MD5 for Last.fm request signing (api_sig = md5 of sorted params + secret).
 # Tiny, single-purpose crate. See src/lastfm.rs.
 md5 = "0.7"
@@ -78,7 +77,40 @@ windows-sys = { version = "0.59", features = [
     # process so the SMTC media tile resolves (via the installer's matching Start
     # Menu shortcut) to "YTubic" instead of "Unknown app". See src/appid.rs.
     "Win32_UI_Shell",
+    # PowerRegisterSuspendResumeNotification: wake the session-refresh loop on
+    # resume from sleep/standby instead of waiting out a tokio timer that may
+    # not have advanced while the machine was suspended. See src/power.rs.
+    "Win32_System_Power",
+    # DEVICE_NOTIFY_CALLBACK + the PBT_APM* event codes the callback receives.
+    "Win32_UI_WindowsAndMessaging",
+    # GetNetworkConnectivityHint: don't burn a refresh attempt on a NIC that
+    # hasn't reassociated yet after a resume. See src/power.rs.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
 ] }
+# The taskbar thumbnail toolbar (shuffle / prev / play-pause / next / repeat /
+# like under the taskbar preview) is COM: ITaskbarList3 plus a window subclass
+# for the button clicks. windows-sys has no safe COM wrappers, and the
+# `windows` crate is already in the tree via tauri/wry, so we only add features
+# to a crate that is compiled anyway. See src/thumbbar.rs.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+] }
+# The toolbar takes HICONs, so its glyphs are rasterized at runtime from the
+# same lucide paths the player bar renders — that way the taskbar row looks
+# like a small copy of the in-app player instead of a hand-drawn approximation.
+# default-features off drops text/font handling (fontdb, system-fonts, raster
+# image formats); these icons are pure paths. See src/thumbbar.rs.
+resvg = { version = "0.48.1", default-features = false }
+# PermissionRequested handler on the main webview (src/webview_permissions.rs).
+# Same version tauri/wry already compile.
+webview2-com = "0.38"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 # Cookie jars remain files in app data, but their random AES key lives in the
@@ -96,10 +128,3 @@ webkit2gtk = "=2.0.2"
 [dev-dependencies]
 # ServiceExt::oneshot for the stream-server routing test.
 tower = { version = "0.5", features = ["util"] }
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
-opt-level = 3
-panic = "abort"
-strip = true
