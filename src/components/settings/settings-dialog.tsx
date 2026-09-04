@@ -5,6 +5,7 @@ import {
   IconContrastFilled,
   IconDatabaseFilled,
   IconHomeFilled,
+  IconPlayerPlayFilled,
   IconPuzzleFilled,
   IconX,
 } from "@tabler/icons-react";
@@ -17,6 +18,7 @@ import {
 } from "@/components/ui/dialog";
 import { useUpdateStore } from "@/lib/store/update";
 import { GeneralTab } from "@/components/settings/general-tab";
+import { PlaybackTab } from "@/components/settings/playback-tab";
 import { AppearanceTab } from "@/components/settings/appearance-tab";
 import { HomeTab } from "@/components/settings/home-tab";
 import { StorageTab } from "@/components/settings/storage-tab";
@@ -33,6 +35,7 @@ const TABS: {
   icon: ComponentType<{ className?: string }>;
 }[] = [
   { id: "general", label: "General", icon: IconAdjustmentsFilled },
+  { id: "playback", label: "Playback", icon: IconPlayerPlayFilled },
   { id: "appearance", label: "Appearance", icon: IconContrastFilled },
   // Fork addition: Home-section ordering lives in its own tab (8982ce0).
   { id: "home", label: "Home", icon: IconHomeFilled },
@@ -160,6 +163,7 @@ export function SettingsDialog() {
               back up). */}
           <div className="app-scroll min-w-0 flex-1 overflow-y-auto px-5 pb-[22px] pt-1 [overflow-anchor:none]">
             {tab === "general" && <GeneralTab />}
+            {tab === "playback" && <PlaybackTab />}
             {tab === "appearance" && <AppearanceTab />}
             {tab === "home" && <HomeTab />}
             {tab === "storage" && <StorageTab />}

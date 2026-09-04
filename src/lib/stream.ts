@@ -79,3 +79,27 @@ export async function prefetchStream(videoId: string): Promise<void> {
 export function clearPrefetchMemo(): void {
   prefetched.clear();
 }
+
+/**
+ * Ported from upstream 148246f for the playback-settings merge, adapted:
+ * upstream writes title/artist beside the cache file via Rust
+ * `set_cache_meta` (gated on Premium); this fork keeps titles in the
+ * IndexedDB track-meta store (which already powers the Storage tab's
+ * real-title list) and streams without a Premium gate, so this just
+ * forwards to `rememberTrack` — idempotent, safe every play.
+ */
+export async function saveTrackMeta(
+  videoId: string,
+  track:
+    | { title?: string; subtitle?: string; artists?: { id?: string; name: string }[] }
+    | undefined,
+): Promise<void> {
+  if (!track?.title) return;
+  const { rememberTrack } = await import("@/lib/store/track-meta");
+  rememberTrack({
+    videoId,
+    title: track.title,
+    subtitle: track.subtitle,
+    artists: track.artists,
+  });
+}

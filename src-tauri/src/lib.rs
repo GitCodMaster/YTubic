@@ -374,7 +374,7 @@ fn account_cookies_path(app: &tauri::AppHandle, id: &str) -> PathBuf {
 /// a second webview on the same user-data folder with different args, so a
 /// mismatch makes `open_player_window` fail and the floating player never
 /// appears.
-const APP_WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,HardwareMediaKeyHandling,MediaSessionService";
+const APP_WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,HardwareMediaKeyHandling,MediaSessionService --autoplay-policy=no-user-gesture-required"; // Ported from upstream 148246f: WebAudio graph built before first click must not stay suspended.
 
 /// Legacy single-account path — kept only for migration. New code
 /// should resolve cookies via `active_cookies_path`.

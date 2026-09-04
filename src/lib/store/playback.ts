@@ -1,8 +1,14 @@
 import { create, type StateCreator } from "zustand";
-import { createJSONStorage, persist, type StateStorage } from "zustand/middleware";
+import {
+  createJSONStorage,
+  persist,
+  type StateStorage,
+} from "zustand/middleware";
 import { emit } from "@tauri-apps/api/event";
 import type { ShelfItem, Thumbnail } from "@/lib/innertube/types";
 import { isFloatingPlayerWindow } from "@/lib/floating-player";
+import { usePlaybackSettings } from "./playback-settings";
+import { safeLocalStorage } from "./safe-storage";
 
 export type QueueTrack = {
   videoId: string;
@@ -10,7 +16,8 @@ export type QueueTrack = {
   subtitle?: string;
   artists?: { id?: string; name: string }[];
   album?: string;
-  /** Browse id for `album`, when known — lets the player link the album. */
+  /** Browse id for `album`, when the source row carried one. Lets the
+   *  player's album line link through to the album page. */
   albumId?: string;
   thumbnails: Thumbnail[];
   /** Original duration from browse responses, may be undefined until /player resolves. */
@@ -50,17 +57,10 @@ export type PlaybackState = {
   autoRadio: boolean;
 
   /**
-   * Continuation token for the shuffle station backing the current queue, if
-   * any. While set, the player extends the queue by paging this station
-   * (see `fetchShuffleContinuation`) as it nears the end, instead of falling
-   * back to auto-radio. Cleared whenever a new, non-station queue is loaded.
-   */
-  stationContinuation?: string;
-
-  /**
-   * Continuation token for a server-side playlist shuffle. While set,
-   * the player extends the queue by following this token as it nears
-   * the end, instead of falling back to auto-radio.
+   * Pending /next continuation for the current queue's source — set when
+   * the queue came from a server-side playlist shuffle whose remaining
+   * permutation is still on YTM's side. The audio engine drains it as
+   * playback nears the tail; any action that replaces the queue clears it.
    */
   queueContinuation?: string;
 
@@ -75,9 +75,6 @@ export type PlaybackState = {
   moveTrack: (from: number, to: number) => void;
   clearQueue: () => void;
   setAutoRadio: (on: boolean) => void;
-  /** Set (or clear) the shuffle-station continuation token for the queue. */
-  setStationContinuation: (token?: string) => void;
-  /** Set (or clear) the server-side shuffle continuation token. */
   setQueueContinuation: (token?: string) => void;
 
   // Actions — transport
@@ -128,7 +125,10 @@ function fisherYates<T>(arr: readonly T[]): T[] {
 
 const MAX_PERSISTED_QUEUE_TRACKS = 300;
 
-function compactPersistedQueue(queue: QueueTrack[], index: number): QueueTrack[] {
+function compactPersistedQueue(
+  queue: QueueTrack[],
+  index: number,
+): QueueTrack[] {
   if (queue.length <= MAX_PERSISTED_QUEUE_TRACKS) return queue;
   const safeIndex = Math.max(0, Math.min(index, queue.length - 1));
   const before = Math.floor((MAX_PERSISTED_QUEUE_TRACKS - 1) / 2);
@@ -143,22 +143,19 @@ function persistedQueueIndex(queue: QueueTrack[], index: number): number {
   return safeIndex - Math.max(0, safeIndex - before);
 }
 
-function createDebouncedStorage(delay = 1000): StateStorage | undefined {
-  if (typeof window === "undefined") return undefined;
+/** Avoid serializing and writing the full queue on every position tick. */
+function createDebouncedStorage(delay = 1000): StateStorage {
+  if (typeof window === "undefined") return safeLocalStorage;
   const pending = new Map<string, { value: string; timer: number }>();
   return {
-    getItem: (name) => window.localStorage.getItem(name),
+    getItem: (name) => safeLocalStorage.getItem(name),
     setItem: (name, value) => {
       const existing = pending.get(name);
       if (existing) window.clearTimeout(existing.timer);
       const timer = window.setTimeout(() => {
         const item = pending.get(name);
         if (!item) return;
-        try {
-          window.localStorage.setItem(name, item.value);
-        } catch (e) {
-          console.warn(`[playback] failed to persist "${name}":`, e);
-        }
+        safeLocalStorage.setItem(name, item.value);
         pending.delete(name);
       }, delay);
       pending.set(name, { value, timer });
@@ -167,7 +164,7 @@ function createDebouncedStorage(delay = 1000): StateStorage | undefined {
       const existing = pending.get(name);
       if (existing) window.clearTimeout(existing.timer);
       pending.delete(name);
-      window.localStorage.removeItem(name);
+      safeLocalStorage.removeItem(name);
     },
   };
 }
@@ -178,7 +175,6 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   shuffle: false,
   repeat: "off",
   autoRadio: false,
-  stationContinuation: undefined,
   queueContinuation: undefined,
 
   status: "idle",
@@ -211,7 +207,6 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       duration: mapped.duration ?? 0,
       playing: true,
       error: undefined,
-      stationContinuation: undefined,
       queueContinuation: undefined,
     });
   },
@@ -234,7 +229,6 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       duration: queue[i].duration ?? 0,
       playing: true,
       error: undefined,
-      stationContinuation: undefined,
       queueContinuation: undefined,
     });
   },
@@ -247,9 +241,10 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
     }
     if (tracks.length === 0) return;
     // If the user clicked a non-playable item, find the nearest playable one.
-    const playableOffset = items
-      .slice(0, startIndex + 1)
-      .filter((i) => i.kind === "song" || i.kind === "video").length - 1;
+    const playableOffset =
+      items
+        .slice(0, startIndex + 1)
+        .filter((i) => i.kind === "song" || i.kind === "video").length - 1;
     get().setQueue(tracks, Math.max(0, playableOffset));
   },
 
@@ -348,13 +343,12 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
       playing: false,
       position: 0,
       duration: 0,
-      stationContinuation: undefined,
       queueContinuation: undefined,
     });
   },
 
   setAutoRadio: (on) => set({ autoRadio: on }),
-  setStationContinuation: (token) => set({ stationContinuation: token }),
+
   setQueueContinuation: (token) => set({ queueContinuation: token }),
 
   toggle: () => {
@@ -406,10 +400,16 @@ const playbackStateCreator: StateCreator<PlaybackState> = (set, get) => ({
   prev: () => {
     const { queue, index, position } = get();
     if (queue.length === 0) return;
-    // If >3s in OR already on the first track, just rewind. Without the
-    // index===0 guard the old code would set status=loading and re-resolve
-    // the same stream, flashing the loader spinner for no reason.
-    if (index <= 0 || position > 3) {
+    // The Playback tab's "Back button" rule: always step back, always
+    // restart, or (smart) restart once more than N seconds have played.
+    // The first track can only ever rewind. Rewinding goes through
+    // pendingSeek rather than status=loading so the same stream isn't
+    // re-resolved and the loader doesn't flash for no reason.
+    const { backButton, smartBackSeconds } = usePlaybackSettings.getState();
+    const restart =
+      backButton === "restart" ||
+      (backButton === "smart" && position > smartBackSeconds);
+    if (index <= 0 || restart) {
       if (index >= 0) set({ position: 0, pendingSeek: 0 });
       return;
     }
@@ -482,23 +482,33 @@ export const usePlaybackStore = isFloatingPlayerWindow()
         name: "ytm-playback",
         version: 1,
         // Only the user-facing settings + the queue itself are saved.
-        // Volatile fields (position, status, streamUrl, error,
-        // pendingSeek) and `playing` are reset on rehydrate so a fresh
-        // launch never auto-blasts audio at you.
-        storage: createJSONStorage(() => createDebouncedStorage()!),
+        // Volatile fields (status, streamUrl, error, pendingSeek) and
+        // `playing` are reset on rehydrate so a fresh launch never
+        // auto-blasts audio at you. `position` is saved too, and kept on
+        // rehydrate only when "Resume where you left off" is on; the audio
+        // engine seeks there once the track's metadata has loaded.
+        storage: createJSONStorage(() => createDebouncedStorage()),
         partialize: (s) => ({
           queue: compactPersistedQueue(s.queue, s.index),
           index: persistedQueueIndex(s.queue, s.index),
           shuffle: s.shuffle,
           repeat: s.repeat,
           autoRadio: s.autoRadio,
+          queueContinuation: s.queueContinuation,
           volume: s.volume,
           muted: s.muted,
+          position: s.position,
         }),
         onRehydrateStorage: () => (state) => {
           if (!state) return;
           state.playing = false;
-          state.position = 0;
+          const keepPosition =
+            usePlaybackSettings.getState().resumePlayback &&
+            state.index >= 0 &&
+            state.index < state.queue.length &&
+            Number.isFinite(state.position) &&
+            state.position > 0;
+          if (!keepPosition) state.position = 0;
           state.duration = state.queue[state.index]?.duration ?? 0;
           state.status = "idle";
           state.streamUrl = undefined;
@@ -576,9 +586,17 @@ export function initFloatingPlaybackBridge(): void {
     // mutated only the floater's mirror store — nothing actually played and
     // the queue silently diverged until the next broadcast overwrote it.
     playNow: (track, extras) =>
-      sendAction({ type: "playNow", track: track as unknown, extras: extras as unknown }),
+      sendAction({
+        type: "playNow",
+        track: track as unknown,
+        extras: extras as unknown,
+      }),
     playShelfItems: (items, startIndex) =>
-      sendAction({ type: "playShelfItems", items: items as unknown[], startIndex }),
+      sendAction({
+        type: "playShelfItems",
+        items: items as unknown[],
+        startIndex,
+      }),
     enqueueNext: (track) =>
       sendAction({ type: "enqueueNext", track: track as unknown }),
     enqueueEnd: (track) =>
