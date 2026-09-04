@@ -169,7 +169,6 @@ export function ProgressSlider({
           seek(v);
           setScrub(null);
         }}
-        className="[&_[data-slot=slider-track]]:bg-white/20"
       />
     </div>
   );
@@ -278,7 +277,7 @@ export function VolumeControl({
               value={[pct]}
               max={100}
               step={1}
-              className="h-16 min-h-0 [&_[data-slot=slider-track]]:bg-white/20"
+              className="h-16 min-h-0"
               aria-label="Volume"
               onValueChange={([v]) => setVolume(v / 100)}
             />
@@ -292,7 +291,7 @@ export function VolumeControl({
             value={[pct]}
             max={100}
             step={1}
-            className="min-w-0 flex-1 [&_[data-slot=slider-track]]:bg-white/20"
+            className="min-w-0 flex-1"
             aria-label="Volume"
             onValueChange={([v]) => setVolume(v / 100)}
           />
