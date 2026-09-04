@@ -2287,12 +2287,15 @@ fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<Strin
     let mut command = std::process::Command::new(ytdlp::program(&ytdlp::managed_path(&app)));
     command.args([
         "-j",
+        // Progressive only: the resolved URL is handed straight to an
+        // <audio> element, which can't play the m3u8 formats some
+        // clients now advertise (and we ship no ffmpeg to remux them).
+        // Trailing /best keeps combined-mp4-only videos (format 18)
+        // playable (already sniffed and served as audio/mp4).
         "-f",
-        "bestaudio[ext=webm]/bestaudio/best",
+        "bestaudio[ext=webm][protocol^=http]/bestaudio[protocol^=http]/bestaudio/best",
         "--no-playlist",
         "--no-warnings",
-        "--extractor-args",
-        "youtube:player_client=tv,android",
         &url,
     ]);
     // Windows: a console-less GUI process spawning the console-subsystem
@@ -2329,18 +2332,25 @@ struct DownloadState {
 type DownloadMap = Arc<Mutex<HashMap<String, Arc<DownloadState>>>>;
 
 // NB: streaming is anonymous BY DEFAULT. YouTube's bot-detection treats
-// an authenticated request through a non-browser player client (tv,
-// android) as a bot — it can't produce a PO token, so it looks like
-// an account scraping — and strips every real audio format, leaving only
-// storyboard thumbnails. Anonymous streaming via tv/android avoids
-// that entirely and is the primary path.
+// an authenticated request through a non-browser player client as a bot
+// — it can't produce a PO token, so it looks like an account scraping —
+// and strips every real audio format, leaving only storyboard thumbnails.
+// Anonymous streaming avoids that entirely and is the primary path.
+//
+// Nor do we pin `--extractor-args youtube:player_client=...` any more.
+// YouTube keeps taking clients away (as of 2026-08 `tv` is SABR-only and
+// `android_vr`/`ios`/`mweb` need a GVS PO token, so the old
+// `tv,android_vr`/`tv,android` pins resolved to zero audio formats and
+// every uncached track failed). yt-dlp's own default client list is the
+// thing upstream keeps working, and the managed binary self-updates, so
+// pinning here only opts us out of those fixes.
 //
 // The one exception is age-restricted videos: those can't be played
 // anonymously at all (no client-only bypass survives in current yt-dlp).
-// For those we retry once WITH the signed-in account's cookies via a web
-// client (`web_safari`/`mweb`) — the context where authenticated
-// requests are expected — so cookies are used surgically, only when the
-// anonymous attempt fails with the age-gate error. See `spawn_downloader`.
+// For those we retry once WITH the signed-in account's cookies — the
+// cookies supply the account's age confirmation — so cookies are used
+// surgically, only when the anonymous attempt fails with the age-gate
+// error. See `spawn_downloader`.
 #[derive(Clone)]
 struct StreamServer {
     /// App handle, used solely to decrypt the active account's cookie jar
@@ -2749,16 +2759,14 @@ async fn write_temp_cookies(app: &tauri::AppHandle) -> Option<TempCookies> {
 
 /// Run yt-dlp once for `url`, streaming stdout into `part_path` (created
 /// fresh) and pinging `state.notify` on each chunk. `format` is the `-f`
-/// selector and `player_client` the `youtube:player_client=` value;
-/// `cookies`, when set, is passed via `--cookies`. Returns whether it
-/// succeeded and whether stderr showed the age-gate error so the caller
+/// selector; `cookies`, when set, is passed via `--cookies`. Returns whether
+/// it succeeded and whether stderr showed the age-gate error so the caller
 /// can decide to retry.
 async fn download_attempt(
     program: &std::path::Path,
     url: &str,
     part_path: &std::path::Path,
     format: &str,
-    player_client: &str,
     cookies: Option<&std::path::Path>,
     state: &Arc<DownloadState>,
 ) -> AttemptOutcome {
@@ -2783,9 +2791,7 @@ async fn download_attempt(
         "3",
         "--socket-timeout",
         "15",
-        "--extractor-args",
     ]);
-    cmd.arg(format!("youtube:player_client={player_client}"));
     if let Some(c) = cookies {
         cmd.arg("--cookies").arg(c);
     }
@@ -2903,28 +2909,22 @@ fn spawn_downloader(
 
         let program = ytdlp::program(&srv.ytdlp_bin);
 
-        // Primary attempt: anonymous, via the tv/android clients — best
-        // formats and lowest bot-detection scrutiny (see StreamServer note).
-        const AUDIO_FORMAT: &str = "bestaudio[ext=webm]/bestaudio/best";
-        let mut attempt = download_attempt(
-            &program,
-            &url,
-            &part_path,
-            AUDIO_FORMAT,
-            "tv,android",
-            None,
-            &state,
-        )
-        .await;
+        // Primary attempt: anonymous with yt-dlp's default clients (see
+        // StreamServer note). Progressive http only — the bytes are
+        // handed to an <audio> element via the localhost proxy.
+        // Trailing /best keeps combined-mp4-only videos playable.
+        const AUDIO_FORMAT: &str =
+            "bestaudio[ext=webm][protocol^=http]/bestaudio[protocol^=http]/bestaudio/best";
+        let mut attempt =
+            download_attempt(&program, &url, &part_path, AUDIO_FORMAT, None, &state).await;
 
         // Age-restricted videos can't be streamed anonymously. If the
         // anonymous attempt failed specifically with the age-gate error and
         // an account is signed in, retry once with that account's cookies.
-        // Reuse the tv/android clients (which already return real webm
-        // audio on the anonymous path — the web clients only expose
-        // SABR/storyboard formats here) and just let the cookies supply the
-        // account's age confirmation. A trailing `/best` guards against a
-        // client that omits an audio-only format on the authenticated path.
+        // No client pin (same default list as the anonymous path) — the
+        // cookies supply the account's age confirmation. A trailing `/best`
+        // guards against a client that omits an audio-only format on the
+        // authenticated path.
         if !attempt.ok && attempt.age_gated {
             match write_temp_cookies(&srv.app).await {
                 Some(cookies) => {
@@ -2935,8 +2935,7 @@ fn spawn_downloader(
                         &program,
                         &url,
                         &part_path,
-                        "bestaudio[ext=webm]/bestaudio/best",
-                        "tv,android",
+                        "bestaudio[ext=webm][protocol^=http]/bestaudio[protocol^=http]/bestaudio/best",
                         Some(cookies.path()),
                         &state,
                     )
