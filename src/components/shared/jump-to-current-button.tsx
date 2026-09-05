@@ -6,6 +6,7 @@ import { useSidebar } from "@/components/ui/sidebar";
 import { usePlaybackStore, currentTrack } from "@/lib/store/playback";
 import { useLayoutStore } from "@/lib/store/layout";
 import { usePanelsStore, CARD_CONTENT_GAP } from "@/lib/store/panels";
+import { useSelectionStore } from "@/lib/store/selection";
 import type { ShelfItem } from "@/lib/innertube/types";
 
 type Props = {
@@ -34,6 +35,9 @@ export function JumpToCurrentButton({ tracks }: Props) {
   const mode = useLayoutStore((s) => s.mode);
   const sidebarWidth = usePanelsStore((s) => s.sidebarWidth);
   const cardWidth = usePanelsStore((s) => s.cardWidth);
+  // The selection toolbar takes the same spot; step aside while it is up.
+  // (Upstream e260de6; kept with fork's resizable widths.)
+  const selecting = useSelectionStore((s) => s.active);
   const [activeOnScreen, setActiveOnScreen] = useState(false);
   const [activeAbove, setActiveAbove] = useState(false);
 
@@ -90,7 +94,7 @@ export function JumpToCurrentButton({ tracks }: Props) {
     };
   }, [activeVideoId, inList]);
 
-  if (!active || !inList || activeOnScreen) return null;
+  if (!active || !inList || activeOnScreen || selecting) return null;
 
   // Match the sidebar's and side card's own (now user-resizable) widths
   // so the pill stays horizontally centered in the visible content
