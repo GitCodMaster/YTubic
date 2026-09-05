@@ -64,14 +64,20 @@ This is a fork of [NUber-dev/YTubic](https://github.com/NUber-dev/YTubic). On to
 
 Download the latest installer from the [Releases](../../releases) page and run it.
 
-- **Windows 10/11**: run the `.exe` NSIS installer.
-- **Linux**: install the `.deb` (Debian/Ubuntu), `.rpm` (Fedora/openSUSE), or
+- **Windows 10/11:** run the `.exe` NSIS installer. Pick the `x64` build, or
+  the `arm64` one on a Windows on ARM device.
+- **macOS 10.15+ (beta):** open the universal `.dmg`; the same build supports
+  Apple Silicon and Intel. Login cookies are encrypted with a Keychain-backed
+  key.
+- **Linux (beta):** install the `.deb` (Debian/Ubuntu), `.rpm` (Fedora/openSUSE), or
   run the `AppImage` directly. Requires WebKitGTK 4.1 + GTK 3, plus the
   GStreamer "good" and "base" plugins (and `gst-libav`) — WebKitGTK decodes
   audio through GStreamer, so without `autoaudiosink` + the WebM/Opus/AAC
   demuxers there is no sound. These are pulled in automatically by the
   `.deb`/`.rpm`; for the AppImage install them yourself, e.g. on Arch:
   `sudo pacman -S webkit2gtk-4.1 gst-plugins-base gst-plugins-good gst-libav`.
+  Signing in also requires a desktop Secret Service provider
+  such as GNOME Keyring or a compatible KWallet setup.
 - On first launch the app downloads its own copy of yt-dlp (~12 MB) into its
   data folder and keeps it updated automatically.
 - Signing in is optional: browse and playback work anonymously; sign in to get
