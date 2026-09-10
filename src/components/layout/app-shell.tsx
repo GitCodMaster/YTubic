@@ -45,6 +45,7 @@ import {
   useLoginSuccessListener,
   useSessionRefreshedListener,
 } from "@/lib/store/accounts";
+import { useSessionStatusListener } from "@/lib/store/session-status";
 
 function isEditableTarget(el: EventTarget | null): boolean {
   if (!(el instanceof HTMLElement)) return false;
@@ -96,6 +97,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   useLoginSuccessListener();
   useAccountsChangedListener();
   useSessionRefreshedListener();
+  useSessionStatusListener();
   useAccountMetaBackfill();
   useGlobalShortcuts();
   useCloseBehaviorSync();
