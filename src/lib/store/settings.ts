@@ -40,8 +40,15 @@ type State = {
    *  the floating window (see `components/layout/lyrics-view.tsx`).
    *  Off skips the three lyrics-source fetches and unmounts the
    *  synced-scroll view entirely, saving network + rAF/CPU cost for
-   *  users who don't use lyrics. */
+   *  users who don't use lyrics. (Fork.) */
   lyricsEnabled: boolean;
+  /** Check GitHub Releases at launch and download a newer version in
+   *  the background, leaving only the restart to the user (see
+   *  `lib/updater.ts`). Off: no check at launch, and a check run from
+   *  About only reports the version, downloading waits for a click.
+   *  (Upstream bcb0bbb; fork's Discord/Last.fm live in separate stores,
+   *  so only autoUpdate is ported here.) */
+  autoUpdate: boolean;
   setCloseAction: (v: CloseButtonAction) => void;
   setCacheAutoClean: (v: CacheAutoCleanPeriod) => void;
   markCacheCleaned: () => void;
@@ -51,6 +58,7 @@ type State = {
   setFullscreenLayout: (v: FullscreenLayout) => void;
   setPlaybackNotifications: (v: boolean) => void;
   setLyricsEnabled: (v: boolean) => void;
+  setAutoUpdate: (v: boolean) => void;
 };
 
 /**
@@ -71,6 +79,7 @@ export const useSettingsStore = create<State>()(
       fullscreenLayout: "cover",
       playbackNotifications: false,
       lyricsEnabled: true,
+      autoUpdate: true,
       setCloseAction: (closeAction) => set({ closeAction }),
       setCacheAutoClean: (cacheAutoClean) => set({ cacheAutoClean }),
       markCacheCleaned: () => set({ lastCacheCleanAt: Date.now() }),
@@ -81,6 +90,7 @@ export const useSettingsStore = create<State>()(
       setPlaybackNotifications: (playbackNotifications) =>
         set({ playbackNotifications }),
       setLyricsEnabled: (lyricsEnabled) => set({ lyricsEnabled }),
+      setAutoUpdate: (autoUpdate) => set({ autoUpdate }),
     }),
     { name: "ytm-settings" },
   ),
