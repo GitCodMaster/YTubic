@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use discord_rich_presence::activity::{
-    Activity, ActivityType, Assets, Button, StatusDisplayType, Timestamps,
+    Activity, ActivityType, Assets, Button, Timestamps,
 };
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 use serde::Deserialize;
@@ -61,7 +61,18 @@ fn disconnect(inner: &mut Inner) {
 /// running, no IPC socket yet) is left for the caller to treat as non-fatal —
 /// `inner.client` simply stays `None` and a later `discord_update` retries.
 fn connect(inner: &mut Inner, application_id: &str) {
-    let mut client = DiscordIpcClient::new(application_id);
+    // discord-rich-presence 0.2.5: new() returns a Result (no socket yet),
+    // connect() dials the IPC socket. Both fail when Discord isn't running —
+    // non-fatal, a later update retries.
+    let mut client = match DiscordIpcClient::new(application_id) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[discord] create client failed: {e}");
+            inner.connected = false;
+            inner.client = None;
+            return;
+        }
+    };
     match client.connect() {
         Ok(()) => {
             inner.connected = true;
@@ -188,19 +199,18 @@ pub fn discord_update(state: tauri::State<'_, DiscordState>, payload: PresencePa
     };
 
     let mut activity = Activity::new().activity_type(activity_type);
-    if !payload.name.is_empty() {
-        activity = activity.name(&payload.name);
-    }
+    // Fork note: 0.2.5 has no `.name()` builder (and no StatusDisplayType);
+    // the app name renders by default. Custom names are dropped for 0.2.5
+    // compat — details/state below carry title/artist.
     if !payload.details.is_empty() {
-        // `details` is what we point `status_display_type` at, so it's also
-        // what shows in the member-list one-liner *before* a viewer expands
-        // the card — Discord's default there is just the app's name, so
-        // without this override every listen shows "Listening to <app
-        // name>" until clicked. The frontend folds artist + title into this
-        // field for exactly that reason (see audio-engine.ts).
-        activity = activity
-            .details(&payload.details)
-            .status_display_type(StatusDisplayType::Details);
+        // `details` is what we point `status_display_type` at (see
+        // set_activity_showing_details below), so it's also what shows in
+        // the member-list one-liner *before* a viewer expands the card —
+        // Discord's default there is just the app's name, so without this
+        // override every listen shows "Listening to <app name>" until
+        // clicked. The frontend folds artist + title into this field for
+        // exactly that reason (see audio-engine.ts).
+        activity = activity.details(&payload.details);
     }
     if !payload.state.is_empty() {
         activity = activity.state(&payload.state);
@@ -224,7 +234,7 @@ pub fn discord_update(state: tauri::State<'_, DiscordState>, payload: PresencePa
         )]);
     }
 
-    let result = inner.client.as_mut().unwrap().set_activity(activity);
+    let result = set_activity_showing_details(inner.client.as_mut().unwrap(), activity);
     match result {
         Ok(()) => {
             inner.connected = true;
@@ -238,6 +248,35 @@ pub fn discord_update(state: tauri::State<'_, DiscordState>, payload: PresencePa
             inner.client = None;
         }
     }
+}
+
+/// Discord's `status_display_type` for an activity: which field the member
+/// list and the status line show after "Listening to". 0 is the app name
+/// (the default, "Listening to YTubic"), 1 the state, 2 the details.
+/// Same helper as upstream 1d0cc56: the 0.2.5 builder predates
+/// `status_display_type`, so the activity is serialised here and the field
+/// added before the frame goes out; the envelope is the same one the
+/// crate's own `set_activity` builds.
+const STATUS_DISPLAY_DETAILS: u8 = 2;
+
+fn set_activity_showing_details(
+    client: &mut DiscordIpcClient,
+    activity: Activity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut activity = serde_json::to_value(activity)?;
+    activity["status_display_type"] = serde_json::json!(STATUS_DISPLAY_DETAILS);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    client.send(
+        serde_json::json!({
+            "cmd": "SET_ACTIVITY",
+            "args": { "pid": std::process::id(), "activity": activity },
+            "nonce": nonce.to_string(),
+        }),
+        1,
+    )
 }
 
 /// Clear the presence (queue emptied, track filtered out, paused with

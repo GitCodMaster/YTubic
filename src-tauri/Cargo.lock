@@ -7192,6 +7192,7 @@ version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "axum",
+ "base64 0.22.1",
  "cookie",
  "discord-rich-presence",
  "keyring",
