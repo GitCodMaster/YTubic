@@ -70,14 +70,21 @@ Download the latest installer from the [Releases](../../releases) page and run i
   Apple Silicon and Intel. Login cookies are encrypted with a Keychain-backed
   key.
 - **Linux (beta):** install the `.deb` (Debian/Ubuntu), `.rpm` (Fedora/openSUSE), or
-  run the `AppImage` directly. Requires WebKitGTK 4.1 + GTK 3, plus the
+  run the `AppImage` directly. On Arch, install from the
+  [AUR](https://aur.archlinux.org/packages/ytubic) (`yay -S ytubic`).
+  Requires WebKitGTK 4.1 + GTK 3, plus the
   GStreamer "good" and "base" plugins (and `gst-libav`) — WebKitGTK decodes
   audio through GStreamer, so without `autoaudiosink` + the WebM/Opus/AAC
   demuxers there is no sound. These are pulled in automatically by the
-  `.deb`/`.rpm`; for the AppImage install them yourself, e.g. on Arch:
+  `.deb`/`.rpm`/AUR package; for the AppImage install them yourself, e.g. on Arch:
   `sudo pacman -S webkit2gtk-4.1 gst-plugins-base gst-plugins-good gst-libav`.
   Signing in also requires a desktop Secret Service provider
   such as GNOME Keyring or a compatible KWallet setup.
+- **Updates:** Windows, macOS and AppImage builds update themselves
+  (Settings → General → Automatic Updates). AUR installs update with
+  `yay -Syu`; `.deb`/`.rpm` installs re-download the new file from
+  [Releases](../../releases) — the in-app updater never touches
+  system-owned files.
 - On first launch the app downloads its own copy of yt-dlp (~12 MB) into its
   data folder and keeps it updated automatically.
 - Signing in is optional: browse and playback work anonymously; sign in to get

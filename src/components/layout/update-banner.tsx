@@ -7,6 +7,14 @@ import {
 import type { ComponentType } from "react";
 import { useUpdateStore } from "@/lib/store/update";
 import { downloadAvailableUpdate, restartToUpdate } from "@/lib/updater";
+import {
+  RELEASES_URL,
+  systemUpdateGuidance,
+  useUpdateSource,
+} from "@/lib/update-source";
+import { copyToClipboard } from "@/lib/clipboard";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 type CardConfig = {
@@ -35,6 +43,64 @@ type CardConfig = {
 export function UpdateBanner() {
   const phase = useUpdateStore((s) => s.phase);
   const version = useUpdateStore((s) => s.version);
+  const { data: updateSource } = useUpdateSource();
+  const systemGuidance =
+    updateSource?.kind === "system"
+      ? systemUpdateGuidance(updateSource.manager, updateSource.helper)
+      : null;
+
+  // System installs never download, so "available" is the only phase
+  // that needs a nudge there — and it points at the package manager,
+  // not a restart. Everywhere else the download stays silent and
+  // About owns the parked version.
+  if (systemGuidance) {
+    if (phase === "idle") return null;
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          if (systemGuidance.command !== undefined) {
+            void copyToClipboard(systemGuidance.command).then((ok) => {
+              if (ok) toast.success("Update command copied");
+              else toast.error("Couldn't copy the command");
+            });
+          } else {
+            void openUrl(RELEASES_URL);
+          }
+        }}
+        title={
+          version
+            ? `Version ${version} available via ${systemGuidance.channel}`
+            : `Update available via ${systemGuidance.channel}`
+        }
+        aria-label="Update available"
+        className={cn(
+          "group/upd flex w-full items-center gap-[9px] rounded-[11px] border border-w080 bg-w050 px-[9px] py-2 text-left",
+          "shadow-[inset_0_1px_0_var(--w060)] enabled:cursor-pointer enabled:hover:bg-w090 disabled:cursor-default",
+          "transition-[padding,border-width,border-color,border-radius,background-color,box-shadow] duration-[220ms] ease-[cubic-bezier(.32,.72,0,1)]",
+          "group-data-[collapsible=icon]:rounded-[9px] group-data-[collapsible=icon]:border-0",
+          "group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:p-0",
+          "group-data-[collapsible=icon]:shadow-none group-data-[collapsible=icon]:hover:bg-transparent",
+        )}
+      >
+        <span className="relative grid w-[26px] shrink-0 place-items-center transition-[width] duration-[220ms] ease-[cubic-bezier(.32,.72,0,1)] group-data-[collapsible=icon]:w-9">
+          <span className="grid size-[26px] place-items-center rounded-md bg-w070 text-t3 shadow-[inset_0_0_0_1px_var(--w080)] transition-[width,height,border-radius,background-color,color] duration-[220ms] ease-[cubic-bezier(.32,.72,0,1)] group-data-[collapsible=icon]:h-7 group-data-[collapsible=icon]:w-9 group-data-[collapsible=icon]:group-hover/upd:bg-w110">
+            <IconRefresh className="size-[15px]" />
+          </span>
+        </span>
+        <span data-sidebar-label className="flex min-w-0 flex-1 flex-col gap-px">
+          <span className="truncate text-[12.5px] font-semibold leading-tight tracking-[-0.005em] text-t1">
+            Update available
+          </span>
+          <span className="truncate text-[10.5px] font-medium leading-tight text-t5">
+            {systemGuidance.channel === "AUR"
+              ? "via AUR — click to copy the command"
+              : "via package manager — click for Releases"}
+          </span>
+        </span>
+      </button>
+    );
+  }
 
   // Nothing to show before the package has landed: the download is
   // deliberately silent, and with auto-update off the found version is

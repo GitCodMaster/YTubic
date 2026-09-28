@@ -22,6 +22,11 @@ import { IS_MAC } from "@/lib/platform";
 import { authLoggedInQuery } from "@/lib/store/auth-queries";
 import { useSettingsStore } from "@/lib/store/settings";
 import { checkForUpdates } from "@/lib/updater";
+import {
+  aurUpdateCmd,
+  systemUpdateGuidance,
+  useUpdateSource,
+} from "@/lib/update-source";
 
 export function GeneralTab() {
   return (
@@ -126,6 +131,16 @@ function BehaviorGroup() {
   );
   const autoUpdate = useSettingsStore((s) => s.autoUpdate);
   const setAutoUpdate = useSettingsStore((s) => s.setAutoUpdate);
+  // System installs (AUR, .deb/.rpm) are updated by the package manager:
+  // the toggle would promise downloads the app must never perform.
+  const { data: updateSource } = useUpdateSource();
+  const systemManaged = updateSource?.kind === "system";
+  const managedNote = systemManaged
+    ? systemUpdateGuidance(updateSource.manager, updateSource.helper).channel ===
+      "AUR"
+      ? `This install is managed by pacman (AUR) — refresh it with ${aurUpdateCmd(updateSource.helper)}.`
+      : "This install is managed by your system package manager — fetch new releases from the Releases page."
+    : null;
 
   const toggleAutoUpdate = (enabled: boolean) => {
     setAutoUpdate(enabled);
@@ -200,11 +215,15 @@ function BehaviorGroup() {
       <SettingRow
         icon={IconCircleArrowDownFilled}
         title="Automatic Updates"
-        description="Download updates quietly and install them on your next restart."
+        description={
+          managedNote ??
+          "Download updates quietly and install them on your next restart."
+        }
         control={
           <Switch
             checked={autoUpdate}
             onCheckedChange={toggleAutoUpdate}
+            disabled={systemManaged}
             aria-label="Automatic Updates"
           />
         }

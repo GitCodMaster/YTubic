@@ -23,9 +23,16 @@ import {
 import { useUpdateStore } from "@/lib/store/update";
 import { IS_BETA_PLATFORM, IS_MAC } from "@/lib/platform";
 import { DiscordIcon, GithubIcon } from "@/components/shared/brand-icons";
+import { copyToClipboard } from "@/lib/clipboard";
+import { toast } from "sonner";
+import {
+  RELEASES_URL,
+  systemUpdateGuidance,
+  useUpdateSource,
+} from "@/lib/update-source";
 import { cn } from "@/lib/utils";
 
-const REPO_URL = "https://github.com/NUber-dev/YTubic";
+const REPO_URL = "https://github.com/ameenalasady/YTubic";
 // Fork note: use this fork's Discord (README badge) rather than upstream's.
 // Upstream's X + Donate links from e746966 are intentionally skipped — they
 // are the upstream author's personal links, not relevant to this fork.
@@ -99,8 +106,33 @@ export function AboutDialog({
 
   // The download runs quietly, so the footer narrates it rather than
   // asking for it: a version is coming, it's ready, or it failed.
+  // System installs (AUR, .deb/.rpm) never download — any non-idle phase
+  // there means "a release exists", and the action is the manager
+  // guidance instead of Download/Restart.
+  const { data: updateSource } = useUpdateSource();
+  const systemGuidance =
+    updateSource?.kind === "system"
+      ? systemUpdateGuidance(updateSource.manager, updateSource.helper)
+      : null;
+  const copyUpdateCommand = (command: string) => () => {
+    void copyToClipboard(command).then((ok) => {
+      if (ok) toast.success("Update command copied");
+      else toast.error("Couldn't copy the command");
+    });
+  };
   const updateLine =
-    phase === "ready"
+    systemGuidance && phase !== "idle"
+      ? {
+          text: nextVersion
+            ? `Version ${nextVersion} available via ${systemGuidance.channel}`
+            : `Update available via ${systemGuidance.channel}`,
+          action: systemGuidance.actionLabel,
+          onClick:
+            systemGuidance.command !== undefined
+              ? copyUpdateCommand(systemGuidance.command)
+              : link(RELEASES_URL),
+        }
+      : phase === "ready"
       ? {
           text: nextVersion ? `Version ${nextVersion} ready` : "Update ready",
           action: "Restart",

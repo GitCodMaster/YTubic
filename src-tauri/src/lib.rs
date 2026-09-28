@@ -32,6 +32,7 @@ mod media;
 // upstream 8cdb647.
 #[cfg(windows)]
 mod webview_permissions;
+mod update_source;
 mod ytdlp;
 
 /// Write `bytes` to `path` atomically: a sibling temp file, flushed to
@@ -3573,6 +3574,7 @@ pub fn run() {
             discord::discord_set_config,
             discord::discord_update,
             discord::discord_clear,
+            update_source::update_source,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {

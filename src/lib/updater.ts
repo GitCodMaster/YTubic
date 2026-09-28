@@ -3,6 +3,7 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { toast } from "sonner";
 import { useSettingsStore } from "@/lib/store/settings";
+import { fetchUpdateSource } from "@/lib/update-source";
 import { useUpdateStore } from "@/lib/store/update";
 
 const TOAST_ID = "app-update";
@@ -11,6 +12,20 @@ const TOAST_ID = "app-update";
 // while either is running must not start a parallel copy.
 let checking = false;
 let downloading = false;
+
+/**
+ * True for system-owned installs (AUR, .deb/.rpm) where the package
+ * manager — not the in-app downloader — performs updates. Version
+ * *checks* still run there (a manifest fetch is harmless and lets the
+ * app notify); downloads and installs never do.
+ */
+export async function isSystemInstall(): Promise<boolean> {
+  try {
+    return (await fetchUpdateSource()).kind === "system";
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Check GitHub Releases for a newer version. A found update is handed
@@ -22,10 +37,12 @@ let downloading = false;
  * when the check fails (offline, rate-limit). The manual menu path
  * reports those outcomes.
  *
- * With automatic updates off (Settings > General) the found version is
- * only reported: the store parks in "available" and About offers a
- * Download link. Turning the setting back on picks that parked update
- * up without another round trip.
+ * With automatic updates off (Settings > General) — or on a system
+ * install, where downloads never run — the found version is only
+ * reported: the store parks in "available" and About offers the next
+ * step (Download, or the package-manager guidance). Turning the
+ * setting back on picks that parked update up without another round
+ * trip.
  *
  * While an update is already downloading or ready, a repeat check is a
  * no-op: the About dialog runs one on every open and must not restart
@@ -50,13 +67,15 @@ export async function checkForUpdates({
     return;
   }
   if (store.phase === "available") {
-    if (auto) void downloadUpdate(store.version ?? "", store.handle);
+    if (auto && !(await isSystemInstall()))
+      void downloadUpdate(store.version ?? "", store.handle);
     return;
   }
 
   if (import.meta.env.DEV) {
     if (!silent) {
-      if (auto) void downloadUpdate("9.9.9", null);
+      if (auto && !(await isSystemInstall()))
+        void downloadUpdate("9.9.9", null);
       else store.setAvailable("9.9.9", null);
     }
     return;
@@ -83,7 +102,7 @@ export async function checkForUpdates({
       return;
     }
 
-    if (!auto) {
+    if (!auto || (await isSystemInstall())) {
       store.setAvailable(update.version, update);
       return;
     }
@@ -102,6 +121,7 @@ export async function checkForUpdates({
  * the store; a null handle is the dev preview and replays the mock.
  */
 export async function downloadAvailableUpdate(): Promise<void> {
+  if (await isSystemInstall()) return;
   const { phase, version, handle } = useUpdateStore.getState();
   if (phase !== "available" && phase !== "error") return;
   await downloadUpdate(version ?? "", handle);
@@ -117,6 +137,7 @@ export async function downloadAvailableUpdate(): Promise<void> {
  * restart into, so it just clears the flow and says so.
  */
 export async function restartToUpdate(): Promise<void> {
+  if (await isSystemInstall()) return;
   const store = useUpdateStore.getState();
   if (store.phase !== "ready") return;
   const { handle } = store;
@@ -208,14 +229,26 @@ async function runMockDownload(version: string): Promise<void> {
  * Mount once in AppShell: quiet update check shortly after launch.
  * Delayed a few seconds so it never competes with first paint, feed
  * loading, or the yt-dlp bootstrap for attention/bandwidth. Skipped
- * entirely with automatic updates off; About still checks on open.
+ * entirely with automatic updates off — unless this is a system
+ * install, where the check costs nothing (no download follows) and is
+ * the only way the user learns a release exists; About still checks
+ * on open either way.
  */
 export function useUpdateStartupCheck(): void {
   useEffect(() => {
-    if (!useSettingsStore.getState().autoUpdate) return;
-    const t = window.setTimeout(() => {
-      void checkForUpdates({ silent: true });
-    }, 5000);
-    return () => window.clearTimeout(t);
+    let timer: number | undefined;
+    let cancelled = false;
+    void (async () => {
+      const system = await isSystemInstall();
+      if (cancelled) return;
+      if (!useSettingsStore.getState().autoUpdate && !system) return;
+      timer = window.setTimeout(() => {
+        void checkForUpdates({ silent: true });
+      }, 5000);
+    })();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, []);
 }
