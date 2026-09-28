@@ -988,19 +988,19 @@ export function useAudioEngine() {
         void invoke("media_clear").catch(() => {});
         return;
       }
+      // Fork: Rust media.rs takes flat args (no thumbbar in this fork —
+      // shuffle/repeat/liked fed the Windows taskbar buttons from the
+      // removed thumbbar.rs). Upstream sends nested `now`; that mismatches
+      // this fork's backend, invoke fails silently, and KDE/MPRIS keeps
+      // showing the app logo instead of the song art. Send flat.
       void invoke("media_update", {
-        now: {
-          title: t.title,
-          artist: buildArtistLabel(t),
-          album: t.album ?? "",
-          thumbnail: pickThumbnail(t.thumbnails, 512) ?? "",
-          duration: Number.isFinite(s.duration) ? s.duration : 0,
-          elapsed: s.position,
-          paused: !s.playing,
-          shuffle: s.shuffle,
-          repeat: s.repeat,
-          liked,
-        },
+        title: t.title,
+        artist: buildArtistLabel(t),
+        album: t.album ?? "",
+        thumbnail: pickThumbnail(t.thumbnails, 512) ?? "",
+        duration: Number.isFinite(s.duration) ? s.duration : 0,
+        elapsed: s.position,
+        paused: !s.playing,
       }).catch(() => {});
     };
     push();
