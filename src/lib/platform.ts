@@ -14,6 +14,9 @@ export const IS_LINUX =
   /Linux/i.test(navigator.platform) &&
   !/Android/i.test(navigator.userAgent);
 
+export const IS_WINDOWS =
+  typeof navigator !== "undefined" && /Win/i.test(navigator.platform);
+
 /**
  * Linux and macOS builds ship as public betas: they are compiled and
  * unit-tested in CI but have no dedicated QA before release. Drives the
