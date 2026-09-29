@@ -17,7 +17,7 @@ import { eqGains, usePlaybackSettings } from "@/lib/store/playback-settings";
 import { useDiscordStore, isDiscordConfigured } from "@/lib/store/discord";
 import { resolveStreamId, useTrackSourceStore } from "@/lib/store/track-source";
 import { pickThumbnail } from "@/components/shared/thumbnail";
-import { IS_WINDOWS } from "@/lib/platform";
+import { IS_MAC } from "@/lib/platform";
 // Fork note: Discord/track-meta/playback-position/shuffle restores deferred
 // to a follow-up (see next commit) to keep this port reviewable. Premium
 // gate already removed above.
@@ -26,16 +26,13 @@ import { IS_WINDOWS } from "@/lib/platform";
  * AudioEngine binds the playback store to a singleton HTMLAudioElement and
  * drives the native media controls.
  *
- * On Windows that happens from Rust via souvlaki (SMTC; see
+ * On Windows and Linux that happens from Rust via souvlaki (SMTC / MPRIS; see
  * src-tauri/src/media.rs), and the webview's own media session stays disabled
  * because it belongs to the WebView2 child process and appears as an "Unknown
- * app" duplicate. Everywhere else the web session IS the OS session: macOS
- * feeds WKWebView's Now Playing (which always wins the media keys), and on
- * Linux the entry WebKitGTK publishes over MPRIS is the only one — feeding
- * it directly is also what keeps a metadata-less souvlaki "ytubic" ghost
- * plus WebKit's bare "YTubic" fallback shell from showing up as two players
- * in desktop widgets. Without that, a bare <audio> element leaves
- * next/previous unhandled and the keys do nothing.
+ * app" duplicate. macOS is the exact opposite: WKWebView's media session is the
+ * host process's own and always wins the media keys, so we feed it directly
+ * through `navigator.mediaSession` and skip souvlaki entirely — without that, a
+ * bare <audio> element leaves next/previous unhandled and the keys do nothing.
  *
  * Two <audio> elements exist, one active and one standby. Crossfade
  * preloads the next track on the standby element a few seconds before the
@@ -687,20 +684,19 @@ export function useAudioEngine() {
     }
   }, [pendingSeek]);
 
-  // OS media controls are driven from Rust via souvlaki on Windows only;
-  // everywhere else navigator.mediaSession IS the OS session (Now Playing
-  // on macOS, WebKitGTK's MPRIS entry on Linux). Metadata / state is
-  // pushed by the media_update effect lower down; on Windows the buttons
-  // come back via the media-control listener. See src-tauri/src/media.rs.
+  // OS media controls are driven from Rust via souvlaki, not
+  // navigator.mediaSession — the webview's own media session shows up as
+  // "Unknown app" because it belongs to the WebView2 child process. Metadata /
+  // state is pushed by the media_update effect lower down; buttons come back
+  // via the media-control listener. See src-tauri/src/media.rs.
 
-  // Not Windows: the web session owns Now Playing / MPRIS (see the hook
-  // comment), and the play/pause key already works because WebKit pauses
-  // the element itself — but that also means it flips `el.paused` behind
-  // the store's back, so the handlers below exist to keep the store
-  // authoritative and to supply the next/previous/seek commands a bare
-  // <audio> session simply doesn't have.
+  // macOS only: WKWebView owns the Now Playing session (see the hook comment),
+  // and the play/pause key already works because WebKit pauses the element
+  // itself — but that also means it flips `el.paused` behind the store's back,
+  // so the handlers below exist to keep the store authoritative and to supply
+  // the next/previous/seek commands a bare <audio> session simply doesn't have.
   useEffect(() => {
-    if (IS_WINDOWS || !("mediaSession" in navigator)) return;
+    if (!IS_MAC || !("mediaSession" in navigator)) return;
     const ms = navigator.mediaSession;
     const store = usePlaybackStore.getState;
     ms.setActionHandler("play", () => store().setPlaying(true));
@@ -942,18 +938,16 @@ export function useAudioEngine() {
   // Signature of the metadata last handed to navigator.mediaSession. Re-setting
   // `ms.metadata` makes WebKit re-fetch the artwork URL, so the 2s position
   // refresh must not rebuild it — mirrors the LAST_META guard in media.rs.
-  const lastWebMetaRef = useRef<string | null>(null);
+  const lastMacMetaRef = useRef<string | null>(null);
   useEffect(() => {
-    // Non-Windows: same cadence, but written to the web session the OS
-    // actually listens to (see the hook comment) rather than round-tripped
-    // through souvlaki. On Linux this is what turns WebKitGTK's bare
-    // fallback shell into the real player instead of a ghost next to it.
-    const pushWeb = () => {
+    // macOS: same cadence, but written to the session the OS actually listens
+    // to (see the hook comment) rather than round-tripped through souvlaki.
+    const pushMac = () => {
       const ms = navigator.mediaSession;
       const s = usePlaybackStore.getState();
       const t = s.index >= 0 ? s.queue[s.index] : undefined;
       if (!t) {
-        lastWebMetaRef.current = null;
+        lastMacMetaRef.current = null;
         ms.metadata = null;
         ms.playbackState = "none";
         return;
@@ -962,8 +956,8 @@ export function useAudioEngine() {
       const album = t.album ?? "";
       const cover = pickThumbnail(t.thumbnails, 512) ?? "";
       const sig = `${t.title}${artist}${album}${cover}`;
-      if (lastWebMetaRef.current !== sig) {
-        lastWebMetaRef.current = sig;
+      if (lastMacMetaRef.current !== sig) {
+        lastMacMetaRef.current = sig;
         ms.metadata = new MediaMetadata({
           title: t.title,
           artist,
@@ -984,10 +978,8 @@ export function useAudioEngine() {
       }
     };
     const push = () => {
-      // Windows alone goes through Rust souvlaki; everywhere else the
-      // web session is the player the desktop sees.
-      if (!IS_WINDOWS && "mediaSession" in navigator) {
-        pushWeb();
+      if (IS_MAC && "mediaSession" in navigator) {
+        pushMac();
         return;
       }
       const s = usePlaybackStore.getState();

@@ -1,22 +1,20 @@
 // OS media controls via `souvlaki`: on Windows this is the System Media
 // Transport Controls (SMTC) — the media tile in the Quick Settings / volume
-// flyout, the lock screen, and the hardware media keys.
+// flyout, the lock screen, and the hardware media keys. Linux maps to MPRIS.
 //
-// Windows alone goes through this module. macOS and Linux deliberately do
-// NOT: their webviews publish their own OS sessions as soon as an <audio>
-// element plays — WKWebView's Now Playing on macOS, WebKitGTK's MPRIS entry
-// on Linux — and neither exposes a switch to suppress it (unlike WebView2's
-// --disable-features=MediaSessionService). On macOS that session outranks
-// anything registered on MPRemoteCommandCenter (WebKit handles the keys
-// internally before our commands see them: play/pause appears to work but
-// next/previous are dead on a bare <audio> element). On Linux the extra
-// souvlaki registration shows up next to WebKit's as a second, metadata-less
-// "ytubic" player in desktop widgets. So on both we drive the web session
-// instead of fighting it — `navigator.mediaSession` supplies the metadata
-// and the missing next/previous/seek handlers; see the non-Windows branches
-// in src/lib/audio-engine.ts. The tile still attributes to YTubic because
-// those web sessions belong to the host process, which is exactly the
-// attribution problem Windows has and macOS/Linux don't.
+// macOS deliberately does NOT go through this module. WKWebView publishes its
+// own Now Playing session as soon as an <audio> element plays, and that session
+// outranks anything we register on MPRemoteCommandCenter ourselves: WebKit
+// handles the keys internally before our commands see them. Play/pause appears
+// to work (WebKit pauses the element directly) but next/previous are dead,
+// because a bare <audio> element gives its session no such commands. Unlike
+// WebView2's `--disable-features=MediaSessionService`, WKWebView exposes no
+// switch to suppress it. So on macOS we drive that session instead of fighting
+// it — `navigator.mediaSession` supplies both the metadata and the missing
+// next/previous/seek handlers; see the IS_MAC branches in
+// src/lib/audio-engine.ts. The tile still attributes to YTubic because
+// WKWebView's media session belongs to the host process, which is exactly the
+// attribution problem Windows has and macOS doesn't.
 //
 // Why we drive this from Rust instead of the webview's `navigator.mediaSession`:
 // the audio plays in an `<audio>` element inside WebView2, so Chromium creates
@@ -39,12 +37,12 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use souvlaki::{MediaControls, MediaMetadata, MediaPlayback, MediaPosition};
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "macos"))]
 use souvlaki::{MediaControlEvent, PlatformConfig};
 #[cfg(target_os = "windows")]
 use tauri::Manager;
 use tauri::AppHandle;
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "macos"))]
 use tauri::Emitter;
 
 thread_local! {
@@ -61,20 +59,22 @@ thread_local! {
 /// a `media-control` event. MUST be called on the main thread (from `setup()`),
 /// where souvlaki requires to run and the main window's HWND is available.
 ///
-/// No-op everywhere but Windows (see the module comment): leaving `CONTROLS`
-/// empty makes the souvlaki half of `apply` / `clear` below a no-op too, so
-/// the frontend-owned web session is the only player — no second,
-/// metadata-less ghost next to it in desktop widgets.
+/// No-op on macOS (see the module comment): leaving `CONTROLS` empty makes the
+/// souvlaki half of `apply` / `clear` below a no-op too, so the frontend owns
+/// the Now Playing session outright with no second one competing for the keys.
 pub fn init(app: &AppHandle) {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     let _ = app;
 
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "macos"))]
     {
+        #[cfg(target_os = "windows")]
         let hwnd: Option<*mut std::ffi::c_void> = app
             .get_webview_window("main")
             .and_then(|w| w.hwnd().ok())
             .map(|h| h.0 as *mut std::ffi::c_void);
+        #[cfg(not(target_os = "windows"))]
+        let hwnd: Option<*mut std::ffi::c_void> = None;
 
         let config = PlatformConfig {
             dbus_name: "ytubic",
