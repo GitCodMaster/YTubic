@@ -225,6 +225,11 @@ function FullscreenView({ track }: { track: QueueTrack }) {
             >
               {LAYOUTS.map(({ value, label, Icon }) => {
                 const on = shown === value;
+                // Lyrics master switch lives in Settings; tapping "With
+                // lyrics" while it is off turns it back on instead of
+                // dead-clicking back to the cover view.
+                const wakesLyrics =
+                  value === "lyrics" && !lyricsState.enabled;
                 return (
                   <Tooltip key={value}>
                     <TooltipTrigger asChild>
@@ -232,8 +237,11 @@ function FullscreenView({ track }: { track: QueueTrack }) {
                         type="button"
                         role="radio"
                         aria-checked={on}
-                        aria-label={label}
-                        onClick={() => setLayout(value)}
+                        aria-label={wakesLyrics ? "Turn lyrics on" : label}
+                        onClick={() => {
+                          if (wakesLyrics) lyricsState.setEnabled(true);
+                          setLayout(value);
+                        }}
                         className={cn(
                           "grid h-7 w-[30px] cursor-pointer place-items-center rounded-[7px] transition-colors duration-[160ms] hover:text-(--fs-title)",
                           on
@@ -244,7 +252,9 @@ function FullscreenView({ track }: { track: QueueTrack }) {
                         <Icon />
                       </button>
                     </TooltipTrigger>
-                    <TooltipContent>{label}</TooltipContent>
+                    <TooltipContent>
+                      {wakesLyrics ? "Turn lyrics on" : label}
+                    </TooltipContent>
                   </Tooltip>
                 );
               })}
