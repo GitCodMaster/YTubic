@@ -306,12 +306,15 @@ export function VolumeControl({
       ) : (
         // Inline, not a popup: grows to fill the row so its width tracks
         // the resizable side card instead of a fixed size overflowing it.
+        // The min width is load-bearing outside the card: in the
+        // full-screen transport row the container is shrink-to-fit, so a
+        // pure flex-1 collapses the slider to a sliver.
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <Slider
             value={[pct]}
             max={100}
             step={1}
-            className="min-w-0 flex-1"
+            className="min-w-24 flex-1"
             aria-label="Volume"
             onValueChange={([v]) => setVolume(v / 100)}
           />
