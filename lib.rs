@@ -1,0 +1,4164 @@
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::Command as TokioCommand;
+use tokio::sync::{Mutex, Notify};
+
+use axum::{
+    extract::{Path, Request, State as AxumState},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tower::ServiceExt;
+use tower_http::cors::CorsLayer;
+use tower_http::services::ServeFile;
+
+mod appid;
+mod discord;
+mod media;
+// Grants the microphone to our own pages without WebView2's dialog; the
+// Playback tab needs it to name and pick output devices. Ported from
+// upstream 8cdb647.
+#[cfg(windows)]
+mod webview_permissions;
+mod update_source;
+mod ytdlp;
+
+/// Write `bytes` to `path` atomically: a sibling temp file, flushed to
+/// disk, then renamed over the target.
+///
+/// A bare `fs::write` truncates first, so losing the process mid-write
+/// leaves a zero-length file, and a shutdown does exactly that to a
+/// running app. A truncated `cookies.enc` or `accounts.json` reads as
+/// "signed out" with no way back short of a re-login, which is the
+/// hard-logout variant of the bug users report after a cold boot.
+async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let mut f = tokio::fs::File::create(&tmp).await?;
+    f.write_all(bytes).await?;
+    // fsync before the rename: without it the filesystem can publish the
+    // renamed directory entry while the contents are still only in the
+    // page cache, which is the same torn file by another route.
+    f.sync_all().await?;
+    drop(f);
+    tokio::fs::rename(&tmp, path).await
+}
+
+fn sanitize_video_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() < 32
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Platform-native symmetric "encrypt with current user's credentials"
+/// primitive. On Windows we use DPAPI (CryptProtectData) — the blob is
+/// only decryptable by the same Windows user on the same machine.
+///
+/// On other platforms (Linux/BSD/macOS) we encrypt the blob with
+/// AES-256-GCM and keep the random 256-bit master key in the platform
+/// Secret Service (libsecret / gnome-keyring / KWallet / macOS
+/// Keychain) via the `keyring` crate. The key is user-scoped and
+/// unlocked with the login session, mirroring the DPAPI trust model:
+/// the on-disk `cookies.enc` is opaque ciphertext and only the current
+/// user's unlocked keyring can recover the key.
+///
+/// When no Secret Service is reachable (headless box, locked keyring,
+/// no D-Bus) we degrade to plaintext so sign-in still works — the blob
+/// is written with a scheme byte marking it as plaintext so reads stay
+/// unambiguous. This matches the crate's historical no-crash guarantee.
+///
+/// A fixed `ENTROPY` byte string is mixed into the Windows DPAPI blob
+/// so a *different* app running as the same user can't trivially pass
+/// our blob to CryptUnprotectData and get our cookies out. This is a
+/// small hurdle against generic credential-stealer malware, not a real
+/// boundary — any attacker with our binary can read the entropy string.
+mod secure_store {
+    #[cfg(windows)]
+    // Keeps the historical "ytm-native" tag on purpose: this string is
+    // baked into every existing encrypted cookie jar, and changing it
+    // would orphan them all. It's an opaque salt, not a product name.
+    const ENTROPY: &[u8] = b"ytm-native/cookies.enc v1";
+
+    #[cfg(windows)]
+    pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
+        use std::ptr;
+        use windows_sys::Win32::Security::Cryptography::{
+            CryptProtectData, CRYPT_INTEGER_BLOB,
+        };
+        use windows_sys::Win32::Foundation::LocalFree;
+        unsafe {
+            let in_blob = CRYPT_INTEGER_BLOB {
+                cbData: plain.len() as u32,
+                pbData: plain.as_ptr() as *mut u8,
+            };
+            let ent_blob = CRYPT_INTEGER_BLOB {
+                cbData: ENTROPY.len() as u32,
+                pbData: ENTROPY.as_ptr() as *mut u8,
+            };
+            let mut out_blob: CRYPT_INTEGER_BLOB = std::mem::zeroed();
+            let ok = CryptProtectData(
+                &in_blob,
+                ptr::null(),
+                &ent_blob,
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                &mut out_blob,
+            );
+            if ok == 0 {
+                return Err("CryptProtectData failed".into());
+            }
+            let data =
+                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize)
+                    .to_vec();
+            LocalFree(out_blob.pbData as _);
+            Ok(data)
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
+        use std::ptr;
+        use windows_sys::Win32::Security::Cryptography::{
+            CryptUnprotectData, CRYPT_INTEGER_BLOB,
+        };
+        use windows_sys::Win32::Foundation::LocalFree;
+        unsafe {
+            let in_blob = CRYPT_INTEGER_BLOB {
+                cbData: encrypted.len() as u32,
+                pbData: encrypted.as_ptr() as *mut u8,
+            };
+            let ent_blob = CRYPT_INTEGER_BLOB {
+                cbData: ENTROPY.len() as u32,
+                pbData: ENTROPY.as_ptr() as *mut u8,
+            };
+            let mut out_blob: CRYPT_INTEGER_BLOB = std::mem::zeroed();
+            let ok = CryptUnprotectData(
+                &in_blob,
+                ptr::null_mut(),
+                &ent_blob,
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                &mut out_blob,
+            );
+            if ok == 0 {
+                return Err("CryptUnprotectData failed".into());
+            }
+            let data =
+                std::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize)
+                    .to_vec();
+            LocalFree(out_blob.pbData as _);
+            Ok(data)
+        }
+    }
+
+    // ---- Non-Windows: AES-256-GCM with the key in the Secret Service ----
+
+    /// Self-describing blob header. Legacy blobs written by the old
+    /// plaintext fallback have no header and are detected by the absence
+    /// of this magic, so old `cookies.enc` files keep decrypting.
+    #[cfg(not(windows))]
+    const MAGIC: &[u8; 4] = b"YTSS";
+    #[cfg(not(windows))]
+    const VERSION: u8 = 1;
+    #[cfg(not(windows))]
+    const SCHEME_PLAINTEXT: u8 = 0;
+    #[cfg(not(windows))]
+    const SCHEME_AES_GCM: u8 = 1;
+    #[cfg(not(windows))]
+    const NONCE_LEN: usize = 12;
+
+    /// Fetch the AES-256 master key from the Secret Service, creating and
+    /// persisting a fresh random one on first use. Returns `Err` when no
+    /// Secret Service backend is reachable, which callers treat as
+    /// "fall back to plaintext".
+    #[cfg(not(windows))]
+    fn master_key() -> Result<[u8; 32], String> {
+        use base64::Engine as _;
+        use keyring::Entry;
+
+        let entry = Entry::new("ytubic", "cookies-master-key")
+            .map_err(|e| format!("keyring entry: {e}"))?;
+
+        match entry.get_password() {
+            Ok(b64) => {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .map_err(|e| format!("decode stored key: {e}"))?;
+                let key: [u8; 32] = raw
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "stored key has wrong length".to_string())?;
+                Ok(key)
+            }
+            Err(keyring::Error::NoEntry) => {
+                use rand::RngCore as _;
+                let mut key = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut key);
+                let b64 = base64::engine::general_purpose::STANDARD.encode(key);
+                entry
+                    .set_password(&b64)
+                    .map_err(|e| format!("store new key: {e}"))?;
+                Ok(key)
+            }
+            Err(e) => Err(format!("read key: {e}")),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn wrap(scheme: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(MAGIC.len() + 2 + payload.len());
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        out.push(scheme);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[cfg(not(windows))]
+    pub fn encrypt(plain: &[u8]) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+        use rand::RngCore as _;
+
+        let key = match master_key() {
+            Ok(k) => k,
+            Err(e) => {
+                // No unlocked Secret Service — degrade to plaintext so the
+                // user can still sign in. Marked so reads don't guess.
+                eprintln!(
+                    "[auth] secret service unavailable ({e}); storing cookies unencrypted"
+                );
+                return Ok(wrap(SCHEME_PLAINTEXT, plain));
+            }
+        };
+
+        let cipher = Aes256Gcm::new_from_slice(&key)
+            .map_err(|e| format!("aes init: {e}"))?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(nonce, plain)
+            .map_err(|e| format!("aes encrypt: {e}"))?;
+
+        let mut payload = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        payload.extend_from_slice(&nonce_bytes);
+        payload.extend_from_slice(&ciphertext);
+        Ok(wrap(SCHEME_AES_GCM, &payload))
+    }
+
+    #[cfg(not(windows))]
+    pub fn decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::{Aead, KeyInit};
+        use aes_gcm::{Aes256Gcm, Nonce};
+
+        // Legacy blob with no header: old plaintext fallback wrote the
+        // Netscape jar verbatim. Return it as-is.
+        if encrypted.len() < MAGIC.len() + 2 || &encrypted[..MAGIC.len()] != MAGIC {
+            return Ok(encrypted.to_vec());
+        }
+        let scheme = encrypted[MAGIC.len() + 1];
+        let payload = &encrypted[MAGIC.len() + 2..];
+
+        match scheme {
+            SCHEME_PLAINTEXT => Ok(payload.to_vec()),
+            SCHEME_AES_GCM => {
+                if payload.len() < NONCE_LEN {
+                    return Err("aes blob too short".into());
+                }
+                let key = master_key()?;
+                let cipher = Aes256Gcm::new_from_slice(&key)
+                    .map_err(|e| format!("aes init: {e}"))?;
+                let (nonce_bytes, ciphertext) = payload.split_at(NONCE_LEN);
+                let nonce = Nonce::from_slice(nonce_bytes);
+                cipher
+                    .decrypt(nonce, ciphertext)
+                    .map_err(|e| format!("aes decrypt: {e}"))
+            }
+            other => Err(format!("unknown secure-store scheme {other}")),
+        }
+    }
+}
+
+/// Per-account metadata persisted in `accounts.json`. Cookies are NOT
+/// stored here — they live encrypted under `accounts/<id>/cookies.enc`.
+/// `name` / `email` / `photo_url` start empty for a freshly logged-in
+/// account and get backfilled by the frontend once `/account_menu`
+/// returns the active user's info (see `update_account_meta`).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Account {
+    id: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default, rename = "photoUrl")]
+    photo_url: Option<String>,
+    /// Brand-channel identity within this Google account. `None` means
+    /// the personal (default) channel. Sent as `X-Goog-PageId` on
+    /// InnerTube requests; library, likes and home are scoped to it.
+    #[serde(default, rename = "pageId")]
+    page_id: Option<String>,
+    /// Display meta for the selected channel so the UI can show it
+    /// without a network round-trip.
+    #[serde(default, rename = "channelName")]
+    channel_name: Option<String>,
+    #[serde(default, rename = "channelPhotoUrl")]
+    channel_photo_url: Option<String>,
+    /// Unix seconds when this account was first added.
+    #[serde(default, rename = "addedAt")]
+    added_at: i64,
+}
+
+/// Root document of `accounts.json`. `active` is the id of the
+/// currently-selected account or `None` when the user is signed out
+/// of everything.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+struct AccountsIndex {
+    #[serde(default)]
+    active: Option<String>,
+    #[serde(default)]
+    accounts: Vec<Account>,
+}
+
+/// What we hand back to the frontend — augments [`Account`] with the
+/// derived `isActive` flag so the UI doesn't have to cross-reference
+/// against a second field.
+#[derive(Clone, Debug, serde::Serialize)]
+struct AccountSummary {
+    id: String,
+    email: String,
+    name: String,
+    #[serde(rename = "photoUrl")]
+    photo_url: Option<String>,
+    #[serde(rename = "pageId")]
+    page_id: Option<String>,
+    #[serde(rename = "channelName")]
+    channel_name: Option<String>,
+    #[serde(rename = "channelPhotoUrl")]
+    channel_photo_url: Option<String>,
+    #[serde(rename = "isActive")]
+    is_active: bool,
+}
+
+fn accounts_dir(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("accounts")
+}
+
+fn accounts_index_path(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("accounts.json")
+}
+
+fn account_cookies_path(app: &tauri::AppHandle, id: &str) -> PathBuf {
+    accounts_dir(app).join(id).join("cookies.enc")
+}
+
+/// WebView2 browser args for windows on the DEFAULT user-data folder — the
+/// main window and the floating player. Must stay byte-identical to
+/// `additionalBrowserArgs` in `tauri.conf.json`: WebView2 refuses to create
+/// a second webview on the same user-data folder with different args, so a
+/// mismatch makes `open_player_window` fail and the floating player never
+/// appears.
+const APP_WEBVIEW_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,HardwareMediaKeyHandling,MediaSessionService --autoplay-policy=no-user-gesture-required"; // Ported from upstream 148246f: WebAudio graph built before first click must not stay suspended.
+
+/// Legacy single-account path — kept only for migration. New code
+/// should resolve cookies via `active_cookies_path`.
+fn legacy_cookies_enc_path(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("cookies.enc")
+}
+
+/// Read `accounts.json`. Every failure degrades to an empty index, and
+/// an empty index means `active: None`, which reads as signed out AND
+/// makes the periodic refresh loop a no-op, so nothing can heal it.
+/// That makes the difference between "file isn't there yet" (normal on
+/// a first run) and "file is there but unreadable" (a real fault, most
+/// likely a torn write from a shutdown) worth logging loudly.
+async fn read_index(app: &tauri::AppHandle) -> AccountsIndex {
+    let path = accounts_index_path(app);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return AccountsIndex::default(),
+        Err(e) => {
+            eprintln!("[accounts] read accounts.json failed: {e}; treating as signed out");
+            return AccountsIndex::default();
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(idx) => idx,
+        Err(e) => {
+            eprintln!(
+                "[accounts] accounts.json is unparseable ({} bytes): {e}; treating as signed out",
+                bytes.len()
+            );
+            AccountsIndex::default()
+        }
+    }
+}
+
+async fn write_index(app: &tauri::AppHandle, idx: &AccountsIndex) -> Result<(), String> {
+    let path = accounts_index_path(app);
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| format!("mkdir accounts dir: {e}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(idx).map_err(|e| format!("serialize: {e}"))?;
+    // Atomic: this file is rewritten on every launch (meta backfill,
+    // dedup), so a truncating write opens a signed-out window on every
+    // start.
+    write_atomic(&path, &bytes)
+        .await
+        .map_err(|e| format!("write index: {e}"))
+}
+
+/// Resolve the cookie jar path for the active account, or `None` when
+/// nobody is signed in.
+async fn active_cookies_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let idx = read_index(app).await;
+    let id = idx.active?;
+    Some(account_cookies_path(app, &id))
+}
+
+/// One-time migration: if a plaintext `cookies.txt` from a previous
+/// version exists, encrypt its contents into `cookies.enc` and remove
+/// the original. Best-effort: logs on failure but never blocks startup.
+async fn migrate_plaintext_cookies(app: &tauri::AppHandle) {
+    let enc_path = legacy_cookies_enc_path(app);
+    let old_path = enc_path.with_file_name("cookies.txt");
+    if enc_path.exists() || !old_path.exists() {
+        return;
+    }
+    let Ok(plain) = tokio::fs::read(&old_path).await else {
+        return;
+    };
+    match secure_store::encrypt(&plain) {
+        Ok(enc) => {
+            if let Err(e) = tokio::fs::write(&enc_path, enc).await {
+                eprintln!("[auth] migration write failed: {e}");
+                return;
+            }
+            let _ = tokio::fs::remove_file(&old_path).await;
+            eprintln!("[auth] migrated plaintext cookies.txt to encrypted cookies.enc");
+        }
+        Err(e) => eprintln!("[auth] migration encrypt failed: {e}"),
+    }
+}
+
+/// Promote a legacy single-account `cookies.enc` to the new
+/// `accounts/<id>/cookies.enc` layout. Runs after the plaintext
+/// migration so a fresh install with no state at all hits a clean
+/// no-op. Account meta (email / name / photo) is left empty — the
+/// frontend backfills it on the first `/account_menu` round-trip.
+async fn migrate_to_accounts_layout(app: &tauri::AppHandle) {
+    let index_path = accounts_index_path(app);
+    if index_path.exists() {
+        return; // already migrated
+    }
+    let legacy = legacy_cookies_enc_path(app);
+    if !legacy.exists() {
+        // No legacy state and no new state — signed-out fresh install.
+        return;
+    }
+    let new_id = generate_account_id();
+    let new_path = account_cookies_path(app, &new_id);
+    if let Some(dir) = new_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+            eprintln!("[auth] migrate accounts: mkdir failed: {e}");
+            return;
+        }
+    }
+    if let Err(e) = tokio::fs::rename(&legacy, &new_path).await {
+        eprintln!("[auth] migrate accounts: rename failed: {e}");
+        return;
+    }
+    let now_s = time::OffsetDateTime::now_utc().unix_timestamp();
+    let idx = AccountsIndex {
+        active: Some(new_id.clone()),
+        accounts: vec![Account {
+            id: new_id.clone(),
+            added_at: now_s,
+            ..Default::default()
+        }],
+    };
+    if let Err(e) = write_index(app, &idx).await {
+        eprintln!("[auth] migrate accounts: write index failed: {e}");
+        return;
+    }
+    eprintln!("[auth] migrated single cookies.enc into accounts/{new_id}/");
+}
+
+fn generate_account_id() -> String {
+    let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    // Unix-nanos is monotone within a process; a stray clock skew on
+    // another machine isn't a concern (account ids stay local).
+    format!("acct-{:x}", nanos)
+}
+
+/// Read the encrypted cookie jar for the active account and decrypt
+/// it in memory. Returns `None` when nobody is signed in or
+/// decryption fails (treat as logged-out).
+///
+/// The three ways this returns `None` look identical from the outside
+/// but mean very different things: no active account, a jar that
+/// vanished or was torn by a shutdown, and a blob we can no longer
+/// decrypt (a different OS user, a restored profile), so each is
+/// logged distinctly. A silent `None` here is the single most common
+/// way a signed-in user is shown a sign-in button.
+async fn read_cookies_plain(app: &tauri::AppHandle) -> Option<String> {
+    let path = active_cookies_path(app).await?;
+    read_jar_at(&path).await
+}
+
+/// Decrypt one account's jar off disk. Split out of
+/// `read_cookies_plain` so the merge can compare against the jar it
+/// is about to replace rather than whichever one is active.
+async fn read_jar_at(path: &std::path::Path) -> Option<String> {
+    let encrypted = match tokio::fs::read(path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("[auth] no cookie jar at {}", path.display());
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[auth] read cookie jar failed: {e}");
+            return None;
+        }
+    };
+    let len = encrypted.len();
+    let plain = match tokio::task::spawn_blocking(move || secure_store::decrypt(&encrypted)).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            eprintln!("[auth] decrypt cookie jar failed ({len} bytes): {e}");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[auth] decrypt join failed: {e}");
+            return None;
+        }
+    };
+    match String::from_utf8(plain) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[auth] cookie jar is not valid UTF-8: {e}");
+            None
+        }
+    }
+}
+
+/// Serialize a list of cookies into the Netscape cookie-jar format that
+/// yt-dlp and our reader expect. Only keeps cookies for google/youtube
+/// domains — that's all the auth flow touches.
+fn cookies_to_netscape(cookies: &[cookie::Cookie<'static>]) -> String {
+    let mut out = String::from("# Netscape HTTP Cookie File\n");
+    for c in cookies {
+        let Some(domain) = c.domain() else { continue };
+        let bare = domain.trim_start_matches('.');
+        let allowed = bare == "youtube.com"
+            || bare.ends_with(".youtube.com")
+            || bare == "google.com"
+            || bare.ends_with(".google.com");
+        if !allowed {
+            continue;
+        }
+        // Normalize: always emit with leading dot + subdomains=TRUE.
+        // Auth cookies are all subdomain-inclusive by design, and modern
+        // webviews expose domains inconsistently (with / without the
+        // leading dot). Emitting `domain\tFALSE` for `.youtube.com`
+        // would make parsers treat it as an exact-host cookie, which
+        // would silently skip SAPISID for `music.youtube.com`.
+        let dom_out = format!(".{bare}");
+        let include_sub = "TRUE";
+        let path_str = c.path().unwrap_or("/");
+        let secure = if c.secure().unwrap_or(false) { "TRUE" } else { "FALSE" };
+        let expiry = match c.expires() {
+            Some(cookie::Expiration::DateTime(dt)) => dt.unix_timestamp(),
+            _ => 0,
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            dom_out,
+            include_sub,
+            path_str,
+            secure,
+            expiry,
+            c.name(),
+            c.value()
+        ));
+    }
+    out
+}
+
+/// One line of a Netscape jar, kept as stored so a rewrite preserves
+/// entries we don't touch byte-for-byte.
+struct JarEntry {
+    domain: String,
+    include_sub: String,
+    path: String,
+    secure: String,
+    expiry: i64,
+    name: String,
+    value: String,
+}
+
+/// Apply `Set-Cookie` response headers to a Netscape jar, the way a
+/// browser would: update the value/expiry of a cookie we already hold,
+/// add cookies we don't, and drop cookies the server expires
+/// (`Max-Age=0` / past `Expires`). Only google/youtube domains are
+/// accepted — same filter as the login capture.
+///
+/// Cookies that identify the account.
+///
+/// A `Set-Cookie` deletion for one of these takes the app from signed
+/// in to signed out with no way back except a re-login, and this path
+/// runs on every InnerTube response including 4xx ones. The HTTP replay
+/// layer is not the authority on whether the user signed out, so a
+/// deletion here is refused and reported; the caller decides what to do
+/// with that. Rotation cookies (`*SIDCC`, `*PSIDTS`, `LOGIN_INFO`) stay
+/// deletable: tracking those is the point of the merge.
+const PROTECTED_COOKIES: [&str; 9] = [
+    "SID",
+    "HSID",
+    "SSID",
+    "APISID",
+    "SAPISID",
+    "__Secure-1PSID",
+    "__Secure-3PSID",
+    "__Secure-1PAPISID",
+    "__Secure-3PAPISID",
+];
+
+/// Outcome of folding a batch of `Set-Cookie` headers into a jar.
+struct JarMerge {
+    jar: String,
+    /// A cookie value was replaced, added or removed, so cached Cookie
+    /// headers are stale.
+    value_changed: bool,
+    /// Also covers attribute-only refreshes (expiry bumps) that should
+    /// persist but don't invalidate caches.
+    needs_write: bool,
+    /// `domain name` of every identity cookie the server tried to
+    /// expire and we refused to drop.
+    blocked_deletions: Vec<String>,
+}
+
+fn merge_set_cookies_into_jar(
+    jar: &str,
+    set_cookies: &[String],
+    host: &str,
+    now_ts: i64,
+) -> JarMerge {
+    let mut entries: Vec<JarEntry> = Vec::new();
+    for line in jar.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 7 {
+            continue;
+        }
+        entries.push(JarEntry {
+            domain: f[0].to_string(),
+            include_sub: f[1].to_string(),
+            path: f[2].to_string(),
+            secure: f[3].to_string(),
+            expiry: f[4].parse().unwrap_or(0),
+            name: f[5].to_string(),
+            value: f[6].to_string(),
+        });
+    }
+
+    let mut value_changed = false;
+    let mut needs_write = false;
+    let mut blocked_deletions: Vec<String> = Vec::new();
+    let host_bare = host.trim_start_matches('.').to_ascii_lowercase();
+
+    for raw in set_cookies {
+        let Ok(c) = cookie::Cookie::parse(raw.trim()) else {
+            continue;
+        };
+        // Host-only cookies (no Domain attribute) belong to the
+        // responding host.
+        let bare = c
+            .domain()
+            .unwrap_or(host)
+            .trim_start_matches('.')
+            .to_ascii_lowercase();
+        let allowed = bare == "youtube.com"
+            || bare.ends_with(".youtube.com")
+            || bare == "google.com"
+            || bare.ends_with(".google.com");
+        if !allowed {
+            continue;
+        }
+        // RFC 6265 §5.3.5: a response may only set a cookie whose
+        // Domain the responding host sits at or below. Without this a
+        // music.youtube.com response could plant a cookie on
+        // `.google.com`, which we would then replay to Google as though
+        // Google had issued it.
+        let domain_matches = host_bare == bare || host_bare.ends_with(&format!(".{bare}"));
+        if !domain_matches {
+            continue;
+        }
+
+        // Max-Age wins over Expires (RFC 6265 §4.1.2.2); either in the
+        // past is a deletion.
+        let (remove, expiry) = if let Some(ma) = c.max_age() {
+            let secs = ma.whole_seconds();
+            (secs <= 0, now_ts.saturating_add(secs))
+        } else if let Some(cookie::Expiration::DateTime(dt)) = c.expires() {
+            let ts = dt.unix_timestamp();
+            (ts <= now_ts, ts)
+        } else {
+            (false, 0) // session cookie
+        };
+
+        let pos = entries
+            .iter()
+            .position(|e| e.name == c.name() && e.domain.trim_start_matches('.') == bare);
+
+        if remove {
+            if PROTECTED_COOKIES.contains(&c.name()) {
+                blocked_deletions.push(format!("{bare} {}", c.name()));
+                continue;
+            }
+            if let Some(i) = pos {
+                entries.remove(i);
+                value_changed = true;
+            }
+            continue;
+        }
+
+        match pos {
+            Some(i) => {
+                let e = &mut entries[i];
+                if e.value != c.value() {
+                    e.value = c.value().to_string();
+                    value_changed = true;
+                }
+                if e.expiry != expiry {
+                    e.expiry = expiry;
+                    needs_write = true;
+                }
+            }
+            None => {
+                entries.push(JarEntry {
+                    domain: format!(".{bare}"),
+                    include_sub: "TRUE".to_string(),
+                    path: c.path().unwrap_or("/").to_string(),
+                    secure: if c.secure().unwrap_or(false) { "TRUE" } else { "FALSE" }
+                        .to_string(),
+                    expiry,
+                    name: c.name().to_string(),
+                    value: c.value().to_string(),
+                });
+                value_changed = true;
+            }
+        }
+    }
+
+    needs_write |= value_changed;
+    let mut out = String::from("# Netscape HTTP Cookie File\n");
+    for e in &entries {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            e.domain, e.include_sub, e.path, e.secure, e.expiry, e.name, e.value
+        ));
+    }
+    JarMerge {
+        jar: out,
+        value_changed,
+        needs_write,
+        blocked_deletions,
+    }
+}
+
+/// Stable "same account" key derived from an account's backfilled meta.
+/// Prefers the email; when that's empty (brand-channel identities, and
+/// some accounts, omit it from `/account_menu`) it falls back to the
+/// avatar URL, whose `yt3.ggpht.com/-<token>` base is stable per
+/// account. Returns `None` when neither is known, so two accounts we
+/// can't tell apart are never merged.
+///
+/// Cookie values can't serve as the key: every login runs in an
+/// isolated WebView profile, so Google mints a fresh SAPISID/SID
+/// session each time and the same account lands a different value on
+/// each add.
+fn meta_identity(email: &str, photo_url: Option<&str>) -> Option<String> {
+    let email = email.trim();
+    if !email.is_empty() {
+        return Some(format!("email:{}", email.to_ascii_lowercase()));
+    }
+    if let Some(p) = photo_url {
+        // Drop the "=s108-c-k-..." sizing suffix so the same avatar at
+        // different requested sizes still compares equal.
+        let base = p.split('=').next().unwrap_or(p).trim();
+        if !base.is_empty() {
+            return Some(format!("photo:{base}"));
+        }
+    }
+    None
+}
+
+/// Collapse duplicate account rows that are the same Google account.
+/// Re-adding an account you already have (or a stale/expired re-login)
+/// used to append a fresh row that never merged, because dedup keyed on
+/// an email that `/account_menu` often leaves empty. This heals that
+/// state from the stored meta: within each set of rows sharing an
+/// identity (see `meta_identity`) it keeps the earliest-added one
+/// (stable id, so pinned-playlist buckets survive), copies the freshest
+/// cookies into it, and drops the rest off disk. A row we can't identify
+/// (no email, no avatar) is left untouched rather than risk merging two
+/// real accounts.
+///
+/// Does not emit `accounts-changed`: callers either run it before the
+/// UI reads the list (startup) or emit the event themselves.
+async fn dedup_accounts_by_identity(app: &tauri::AppHandle) {
+    let mut idx = read_index(app).await;
+    if idx.accounts.len() < 2 {
+        return;
+    }
+
+    // Identity per row from its stored meta, same order as idx.accounts.
+    let identities: Vec<Option<String>> = idx
+        .accounts
+        .iter()
+        .map(|a| meta_identity(&a.email, a.photo_url.as_deref()))
+        .collect();
+
+    // Group row indices by identity.
+    let mut groups: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, ident) in identities.iter().enumerate() {
+        if let Some(key) = ident {
+            groups.entry(key.clone()).or_default().push(i);
+        }
+    }
+
+    // removed id -> keeper id, so `active` can follow its keeper.
+    let mut remap: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // (source id, keeper id) jars to copy before deleting the source.
+    let mut fresh_copies: Vec<(String, String)> = Vec::new();
+
+    for members in groups.values() {
+        if members.len() < 2 {
+            continue;
+        }
+        // Keep the earliest-added row: its id is the one pins are keyed
+        // to, and it's the account the user has had the longest.
+        let keeper = *members
+            .iter()
+            .min_by_key(|&&i| idx.accounts[i].added_at)
+            .unwrap();
+        let keeper_id = idx.accounts[keeper].id.clone();
+
+        // Freshest cookies: the jar written most recently. After a
+        // re-login that's the keeper itself (login-time dedup refreshed
+        // it in place, so no copy happens); when healing a pile of
+        // legacy dups it's whichever login was most recent, the one
+        // most likely to still authenticate. Falls back to the keeper
+        // if no jar's mtime can be read.
+        let mut freshest = keeper;
+        let mut best_mtime: Option<std::time::SystemTime> = None;
+        for &i in members {
+            let p = account_cookies_path(app, &idx.accounts[i].id);
+            let mtime = tokio::fs::metadata(&p)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if let Some(t) = mtime {
+                if best_mtime.map_or(true, |b| t > b) {
+                    best_mtime = Some(t);
+                    freshest = i;
+                }
+            }
+        }
+        let fresh_id = idx.accounts[freshest].id.clone();
+        if fresh_id != keeper_id {
+            fresh_copies.push((fresh_id, keeper_id.clone()));
+        }
+
+        for &i in members {
+            if i != keeper {
+                remap.insert(idx.accounts[i].id.clone(), keeper_id.clone());
+            }
+        }
+    }
+
+    if remap.is_empty() {
+        return;
+    }
+
+    for (from_id, keeper_id) in &fresh_copies {
+        let from_path = account_cookies_path(app, from_id);
+        let keep_path = account_cookies_path(app, keeper_id);
+        if let Ok(bytes) = tokio::fs::read(&from_path).await {
+            let _ = tokio::fs::write(&keep_path, bytes).await;
+        }
+    }
+
+    if let Some(active) = idx.active.clone() {
+        if let Some(keeper) = remap.get(&active) {
+            idx.active = Some(keeper.clone());
+        }
+    }
+
+    idx.accounts.retain(|a| !remap.contains_key(&a.id));
+
+    // Persist the collapsed index BEFORE deleting the losers' jars. If
+    // the app dies in between, an orphan dir is invisible litter; the
+    // reverse order could leave the index pointing at deleted jars and
+    // boot the app signed out.
+    let removed = remap.len();
+    if let Err(e) = write_index(app, &idx).await {
+        eprintln!("[accounts] dedup write index: {e}");
+        return;
+    }
+    for rid in remap.keys() {
+        let _ = tokio::fs::remove_dir_all(accounts_dir(app).join(rid)).await;
+    }
+    eprintln!("[accounts] collapsed {removed} duplicate account row(s) by identity");
+}
+
+/// Best-effort cleanup of transient login artifacts, run once per boot:
+///
+/// - leftover per-login WebView profiles under `login-sessions/`. The
+///   post-login `remove_dir_all` regularly loses to WebView2 file locks
+///   (the browser subprocess outlives the window for a beat), and each
+///   stranded profile holds a signed-in Google session on disk. At boot
+///   no login window exists, so the locks are gone and deletion sticks.
+/// - the http plugin's `.cookies` store from builds where its `cookies`
+///   feature was still on: plaintext session-security cookies, and the
+///   shadow copy that fed the rotation-divergence bug.
+async fn cleanup_login_artifacts(app: &tauri::AppHandle) {
+    let cache = app
+        .path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    if let Ok(mut sessions) = tokio::fs::read_dir(cache.join("login-sessions")).await {
+        while let Ok(Some(entry)) = sessions.next_entry().await {
+            let _ = tokio::fs::remove_dir_all(entry.path()).await;
+        }
+    }
+    let _ = tokio::fs::remove_file(cache.join(".cookies")).await;
+}
+
+/// Open an in-app Google sign-in window in an isolated WebView profile
+/// and add the resulting cookies as a new account. Polls the (fresh)
+/// webview cookie store until YouTube auth cookies appear, encrypts
+/// them, writes them to `accounts/<id>/cookies.enc`, registers the
+/// account in `accounts.json`, and marks it active.
+///
+/// Isolation matters: without it, "add another account" instantly
+/// succeeds with whatever Google session is already in the shared
+/// WebView2 user data dir — and there's no way for the user to pick a
+/// different identity. The temp profile is deleted on close (success
+/// or cancellation); our DPAPI-encrypted jar is the canonical store.
+///
+/// Emits `login-success` (payload: new account id) on success and
+/// `login-cancelled` on close-without-auth.
+///
+/// We deliberately do NOT emit `accounts-changed` here. The newly-
+/// added account has empty meta and may not even survive the next
+/// step: the frontend's meta backfill calls `update_account_meta`,
+/// which is when we find out via an identity lookup (email, or avatar
+/// when the email is empty) whether this is genuinely a new account or
+/// a re-sign-in of an existing one. That
+/// command emits `accounts-changed` for both cases, and the global
+/// listener does its full reset there. Firing the event twice was the
+/// "double-reset on dedup" UX bug.
+#[tauri::command]
+async fn start_login(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window("login") {
+        let _ = existing.show();
+        let _ = existing.set_focus();
+        return Ok(());
+    }
+
+    // Fresh per-attempt WebView profile so Google's auth cookies are
+    // empty at window open. Lives under app_cache_dir (transient by
+    // nature) and gets cleaned up after the window closes.
+    let session_id = generate_account_id();
+    let webview_data = app
+        .path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("login-sessions")
+        .join(&session_id);
+    if let Err(e) = tokio::fs::create_dir_all(&webview_data).await {
+        eprintln!("[login] mkdir webview-data: {e}");
+    }
+
+    const SERVICE_LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fmusic.youtube.com%2F";
+    let url = SERVICE_LOGIN_URL
+        .parse::<tauri::Url>()
+        .map_err(|e| e.to_string())?;
+
+    let win = WebviewWindowBuilder::new(&app, "login", WebviewUrl::External(url))
+        .title("Sign in — accounts.google.com")
+        .inner_size(500.0, 720.0)
+        .min_inner_size(420.0, 560.0)
+        .center()
+        .data_directory(webview_data.clone())
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        )
+        // Surface the current origin in the title so the user can spot
+        // a redirect to an unexpected host (anti-phishing).
+        .on_page_load(|win, payload| {
+            let host = payload.url().host_str().unwrap_or("???");
+            let _ = win.set_title(&format!("Sign in — {host}"));
+        })
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let app_poll = app.clone();
+    let cleanup_dir = webview_data.clone();
+    tauri::async_runtime::spawn(async move {
+        // Set to true once we've redirected the webview to YT ourselves.
+        // Guards against thrashing if YT auto-sign-in is slow and we
+        // catch a Google-auth-only state on multiple ticks.
+        let mut nudged_to_yt = false;
+        // Ticks spent waiting for the handshake to finish after auth
+        // cookies first appear (see below).
+        let mut full_set_grace: u8 = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+
+            let Some(win) = app_poll.get_webview_window("login") else {
+                let _ = app_poll.emit("login-cancelled", ());
+                let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                return;
+            };
+
+            let cookies = match win.cookies() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[login] cookies error: {e}");
+                    continue;
+                }
+            };
+
+            let has_yt_auth = cookies.iter().any(|c| {
+                let name = c.name();
+                (name == "__Secure-1PSID" || name == "SAPISID")
+                    && c.domain()
+                        .map(|d| d.trim_start_matches('.').ends_with("youtube.com"))
+                        .unwrap_or(false)
+            });
+
+            if !has_yt_auth {
+                // YT cookies aren't set yet. Two ways to land here:
+                //   1) User hasn't completed Google sign-in. Keep waiting.
+                //   2) Google sign-in succeeded but Google parked the
+                //      webview on `myaccount.google.com` (first-time
+                //      security review / "stay signed in?" prompt) and
+                //      never honored the `continue=music.youtube.com`
+                //      hint. The user is stuck on a Google settings
+                //      page and YT never gets a chance to handshake.
+                //
+                // For case (2), replay the ServiceLogin URL when the current
+                // page host is myaccount.google.com. With a live Google
+                // session, Google's own redirect chain bridges the
+                // .google.com cookies into the .youtube.com cookies that
+                // InnerTube needs; navigating straight to music.youtube.com
+                // relied on YT's client-side auto-sign-in, which completed
+                // only about half the time and left a bare page.
+                // Do NOT force-navigate while the natural continue
+                // redirect to YT is in flight — cancelling it breaks
+                // the YT auto-sign-in handshake.
+                if !nudged_to_yt {
+                    let has_google_auth = cookies.iter().any(|c| {
+                        let name = c.name();
+                        (name == "SAPISID"
+                            || name == "SID"
+                            || name == "__Secure-1PSID")
+                            && c.domain()
+                                .map(|d| {
+                                    d.trim_start_matches('.').ends_with("google.com")
+                                })
+                                .unwrap_or(false)
+                    });
+                    if has_google_auth {
+                        // Only nudge when Google parked us on an account-
+                        // settings page and never honoured the
+                        // continue=…music.youtube.com hint.
+                        // If we're already on or heading to a YouTube host
+                        // the natural redirect chain is carrying the YT
+                        // handshake — calling win.navigate() here would
+                        // cancel it mid-flight and the .youtube.com auth
+                        // cookies would never get set (the sign-in window
+                        // would just sit on music.youtube.com forever).
+                        let parked = win
+                            .url()
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| {
+                                h.ends_with("myaccount.google.com")
+                            }))
+                            .unwrap_or(false);
+                        if parked {
+                            if let Ok(url) = SERVICE_LOGIN_URL.parse::<tauri::Url>() {
+                                match win.navigate(url) {
+                                    Ok(()) => eprintln!(
+                                        "[login] google-auth detected on parked page; replayed ServiceLogin so Google bridges the youtube.com cookies itself"
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[login] failed to redirect to YT: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        nudged_to_yt = true;
+                    }
+                }
+                continue;
+            }
+
+            // SAPISID shows up before YouTube finishes its handshake;
+            // capturing at first sight used to miss LOGIN_INFO /
+            // VISITOR_INFO1_LIVE / YSC. Those make our replayed traffic
+            // look like the browser session Google issued it to, so
+            // give the handshake a few ticks to complete. Capture
+            // anyway after ~6 s in case the cookie set changes shape.
+            let has_login_info = cookies.iter().any(|c| {
+                c.name() == "LOGIN_INFO"
+                    && c.domain()
+                        .map(|d| d.trim_start_matches('.').ends_with("youtube.com"))
+                        .unwrap_or(false)
+            });
+            if !has_login_info && full_set_grace < 4 {
+                full_set_grace += 1;
+                continue;
+            }
+
+            let new_id = generate_account_id();
+            let cookies_path = account_cookies_path(&app_poll, &new_id);
+            if let Some(dir) = cookies_path.parent() {
+                let _ = tokio::fs::create_dir_all(dir).await;
+            }
+            let plain = cookies_to_netscape(&cookies).into_bytes();
+            let encrypted = match tokio::task::spawn_blocking(move || {
+                secure_store::encrypt(&plain)
+            })
+            .await
+            {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => {
+                    eprintln!("[login] encrypt cookies: {e}");
+                    let _ = win.close();
+                    let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[login] encrypt join: {e}");
+                    let _ = win.close();
+                    let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                    return;
+                }
+            };
+            if let Err(e) = write_atomic(&cookies_path, &encrypted).await {
+                eprintln!("[login] write account cookies: {e}");
+                let _ = win.close();
+                let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                return;
+            }
+
+            let mut idx = read_index(&app_poll).await;
+            let now_s = time::OffsetDateTime::now_utc().unix_timestamp();
+            idx.accounts.push(Account {
+                id: new_id.clone(),
+                added_at: now_s,
+                ..Default::default()
+            });
+            idx.active = Some(new_id.clone());
+            if let Err(e) = write_index(&app_poll, &idx).await {
+                // We've already written the cookies file; not fatal but
+                // visible to the user as "account didn't appear in
+                // list". Surface it through the cancel event so the
+                // frontend at least flips out of the spinning state.
+                eprintln!("[login] write index: {e}");
+                let _ = app_poll.emit("login-cancelled", ());
+                let _ = tokio::fs::remove_dir_all(&account_cookies_path(&app_poll, &new_id)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default()).await;
+                let _ = win.close();
+                let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+                return;
+            }
+
+            // `login-success` is the soft signal: the frontend invalidates
+            // its auth queries so the meta backfill runs with the new
+            // cookies. The follow-up `update_account_meta` call is where
+            // dedup happens (by identity, email or avatar) and where
+            // `accounts-changed` fires, so we never run the full reset
+            // twice for one login flow.
+            let _ = app_poll.emit("login-success", &new_id);
+            let _ = win.close();
+            let _ = tokio::fs::remove_dir_all(&cleanup_dir).await;
+            return;
+        }
+    });
+
+    let _ = win;
+    Ok(())
+}
+
+/// Parse a Netscape cookie jar and return a `Cookie:` header value
+/// containing all cookies that match the given domain (honoring the
+/// `include_subdomains` flag). Empty string if no jar or no matches.
+async fn read_cookie_header(app: &tauri::AppHandle, host: &str) -> String {
+    let Some(content) = read_cookies_plain(app).await else {
+        return String::new();
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for line in content.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        // domain \t include_subdomains \t path \t secure \t expiry \t name \t value
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+        let domain = fields[0].trim_start_matches('.');
+        let include_sub = fields[1] == "TRUE";
+        let matches = host == domain
+            || (include_sub && host.ends_with(&format!(".{domain}")));
+        if !matches {
+            continue;
+        }
+        parts.push(format!("{}={}", fields[5], fields[6]));
+    }
+    parts.join("; ")
+}
+
+#[tauri::command]
+async fn get_cookie_header(
+    app: tauri::AppHandle,
+    host: String,
+) -> Result<String, String> {
+    Ok(read_cookie_header(&app, &host).await)
+}
+
+/// Does this `Cookie:` header carry what an authenticated InnerTube
+/// call actually needs: an APISID to build the SAPISIDHASH with, and a
+/// session id to identify the account.
+///
+/// Exact names, on purpose. The old check was `contains("SAPISID") ||
+/// contains("__Secure-1PSID")`, and `__Secure-1PSID` is a prefix of both
+/// `__Secure-1PSIDTS` and `__Secure-1PSIDCC`, so a jar that had lost the
+/// real session id still reported a live session.
+fn header_has_auth_cookie(header: &str) -> bool {
+    let mut has_apisid = false;
+    let mut has_sid = false;
+    for part in header.split(';') {
+        let Some((name, _)) = part.split_once('=') else {
+            continue;
+        };
+        match name.trim() {
+            "SAPISID" | "__Secure-1PAPISID" | "__Secure-3PAPISID" => has_apisid = true,
+            "SID" | "__Secure-1PSID" | "__Secure-3PSID" => has_sid = true,
+            _ => {}
+        }
+    }
+    has_apisid && has_sid
+}
+
+#[tauri::command]
+async fn is_logged_in(app: tauri::AppHandle) -> Result<bool, String> {
+    let header = read_cookie_header(&app, "music.youtube.com").await;
+    Ok(header_has_auth_cookie(&header))
+}
+
+/// Ask music.youtube.com whether the jar we replay still authenticates.
+///
+/// `is_logged_in` only proves that a cookie by the right name sits in a
+/// file. This is the real thing: the signed-in home page carries
+/// `"LOGGED_IN":true` in its bootstrap config and the anonymous one
+/// carries `false`, which discriminates cleanly (the signed-in document
+/// is also markedly larger). Exposed as a command for diagnosing a
+/// user's machine when the app reports signed-out at launch.
+async fn probe_session_alive(app: &tauri::AppHandle) -> Result<bool, String> {
+    let cookie = read_cookie_header(app, "music.youtube.com").await;
+    if !header_has_auth_cookie(&cookie) {
+        return Ok(false);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("build probe client: {e}"))?;
+    let res = client
+        .get("https://music.youtube.com/")
+        .header("Cookie", cookie)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send()
+        .await
+        .map_err(|e| format!("probe request: {e}"))?;
+    let body = res.text().await.map_err(|e| format!("probe body: {e}"))?;
+    Ok(body.contains("\"LOGGED_IN\":true"))
+}
+
+#[tauri::command]
+async fn probe_session(app: tauri::AppHandle) -> Result<bool, String> {
+    let alive = probe_session_alive(&app).await?;
+    eprintln!("[probe] session alive: {alive}");
+    Ok(alive)
+}
+
+/// Hard-exit the process. The window's close button hides into the tray
+/// by default (see `WindowEvent::CloseRequested` below); this command is
+/// the frontend's equivalent of the tray's Quit menu item.
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
+/// What the title-bar ✕ does, mirrored from the frontend settings store
+/// (`useCloseBehaviorSync`). Lives in Rust rather than only in
+/// localStorage because the decision point is the `CloseRequested`
+/// window event, which must also cover Alt+F4 and the taskbar's Close.
+/// Defaults to hide-to-tray until the frontend pushes a value shortly
+/// after the webview boots.
+#[derive(Default)]
+struct CloseBehavior {
+    quit_on_close: AtomicBool,
+}
+
+#[tauri::command]
+fn set_close_behavior(
+    state: tauri::State<'_, CloseBehavior>,
+    quit_on_close: bool,
+) {
+    state.quit_on_close.store(quit_on_close, Ordering::Relaxed);
+}
+
+/// Register / unregister the app for launch at OS startup. Uses the
+/// autostart plugin's Rust API from our own command so the frontend
+/// needs no extra capability grants.
+#[tauri::command]
+fn autostart_set(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let currently = autolaunch.is_enabled().unwrap_or(false);
+    if enabled == currently {
+        return Ok(());
+    }
+    if enabled {
+        autolaunch.enable().map_err(|e| e.to_string())
+    } else {
+        autolaunch.disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn autostart_is_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+/// Track-change toast (Settings → General → Playback notifications).
+/// The focus check lives here rather than in JS so it covers every
+/// window at once: a toast is only useful when the user isn't already
+/// looking at the app (main window hidden to tray, or another app in
+/// the foreground).
+#[tauri::command]
+fn notify_track(
+    app: tauri::AppHandle,
+    title: String,
+    body: String,
+) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    let any_focused = app
+        .webview_windows()
+        .values()
+        .any(|w| w.is_focused().unwrap_or(false));
+    if any_focused {
+        return Ok(());
+    }
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| e.to_string())
+}
+
+/// Bring the main window to the front. Called from the floating
+/// player when the user clicks an in-bar link (e.g. an artist name)
+/// — without this, the navigation would fire silently in the
+/// background while the floating window keeps focus.
+#[tauri::command]
+fn focus_main_window(app: tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// Spawn (or refocus) the standalone floating-player window. The
+/// frontend renders a stripped-down version of itself when it sees
+/// `?floating-player=1` in the URL, so the new window hosts only the
+/// player UI. Audio playback stays in the main window — the floater
+/// mirrors state via Tauri events.
+///
+/// `x` / `y` are screen coords (CSS / logical pixels, as JS reports
+/// them). When provided, the window appears centered horizontally on
+/// the cursor with the title bar just under it — the natural landing
+/// spot when the user drags the cover out of the main window. When
+/// omitted, the window-state plugin's saved position takes over.
+#[tauri::command]
+async fn open_player_window(
+    app: tauri::AppHandle,
+    x: Option<f64>,
+    y: Option<f64>,
+) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window("player") {
+        let _ = existing.show();
+        let _ = existing.unminimize();
+        let _ = existing.set_focus();
+        if let (Some(cx), Some(cy)) = (x, y) {
+            let _ = existing.set_position(tauri::LogicalPosition::new(
+                cx - 180.0,
+                cy - 18.0,
+            ));
+        }
+        return Ok(());
+    }
+    // The min height is sized so the Play/Pause control stays
+    // visible at the narrowest legal window: titlebar (36) + p-4 top
+    // (16) + cover (capped at 320 via `max-w-[20rem]` on the cover
+    // wrapper) + gap (12) + meta (~36) + gap (12) + progress (~54)
+    // + gap (12) + controls (~48) + p-3 bottom (12) ≈ 558. Lyrics
+    // and the bottom button row sit below and graciously collapse
+    // (lyrics is `flex-1 min-h-0`) when there isn't room.
+    let win = WebviewWindowBuilder::new(
+        &app,
+        "player",
+        WebviewUrl::App("index.html?floating-player=1".into()),
+    )
+    .title("YTubic — player")
+    .decorations(false)
+    .inner_size(360.0, 720.0)
+    .min_inner_size(320.0, 560.0)
+    .resizable(true)
+    .skip_taskbar(false)
+    // Tauri's default drag/drop handler swallows in-page HTML5 drag
+    // events on WebView2, breaking the queue reorder. We don't
+    // accept dropped files anywhere in the app, so disabling the
+    // handler entirely is purely upside. The doc string for this
+    // method literally calls out HTML5 DnD on Windows as the use case.
+    .disable_drag_drop_handler()
+    // Shares the default user-data folder with the main window, so the
+    // args must match the main window's `additionalBrowserArgs` exactly.
+    .additional_browser_args(APP_WEBVIEW_ARGS)
+    .build()
+    .map_err(|e| e.to_string())?;
+    // Dev builds: orange taskbar icon, same as the main window.
+    #[cfg(debug_assertions)]
+    let _ = win.set_icon(runtime_icon(&app));
+    if let (Some(cx), Some(cy)) = (x, y) {
+        // Override whatever the window-state plugin restored. Centering
+        // horizontally on cursor with the 36px-tall title bar just
+        // below puts the user's release point on top of the new card,
+        // which feels like the window snapped to where they dropped.
+        let _ = win.set_position(tauri::LogicalPosition::new(
+            cx - 180.0,
+            cy - 18.0,
+        ));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn close_player_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("player") {
+        w.close().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Sign the user out of every account they've added. Wipes the
+/// accounts index, removes each per-account cookies dir, and emits
+/// `accounts-changed` so the UI can collapse back to the signed-out
+/// state. Mirrors the old single-account `clear_cookies` semantics
+/// — "the app forgets you entirely" — extended to the multi-account
+/// world.
+#[tauri::command]
+async fn clear_cookies(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = accounts_dir(&app);
+    if dir.exists() {
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .map_err(|e| format!("remove accounts dir: {e}"))?;
+    }
+    let index = accounts_index_path(&app);
+    if index.exists() {
+        tokio::fs::remove_file(&index)
+            .await
+            .map_err(|e| format!("remove index: {e}"))?;
+    }
+    // Sweep any stray legacy file too — defends against a partially-
+    // migrated install where someone manually copied state around.
+    let legacy = legacy_cookies_enc_path(&app);
+    if legacy.exists() {
+        let _ = tokio::fs::remove_file(&legacy).await;
+    }
+    let _ = app.emit("accounts-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_accounts(app: tauri::AppHandle) -> Result<Vec<AccountSummary>, String> {
+    let idx = read_index(&app).await;
+    let active = idx.active.clone();
+    Ok(idx
+        .accounts
+        .into_iter()
+        .map(|a| {
+            let is_active = active.as_deref() == Some(a.id.as_str());
+            AccountSummary {
+                id: a.id,
+                email: a.email,
+                name: a.name,
+                photo_url: a.photo_url,
+                page_id: a.page_id,
+                channel_name: a.channel_name,
+                channel_photo_url: a.channel_photo_url,
+                is_active,
+            }
+        })
+        .collect())
+}
+
+/// Switch the active account. The InnerTube client picks up the new
+/// cookies on its next request via `get_cookie_header`; the frontend
+/// invalidates its query cache on the `accounts-changed` event.
+#[tauri::command]
+async fn switch_account(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let mut idx = read_index(&app).await;
+    if !idx.accounts.iter().any(|a| a.id == id) {
+        return Err(format!("no such account: {id}"));
+    }
+    if idx.active.as_deref() == Some(id.as_str()) {
+        return Ok(()); // already active — silent no-op
+    }
+    idx.active = Some(id);
+    write_index(&app, &idx).await?;
+    let _ = app.emit("accounts-changed", ());
+    Ok(())
+}
+
+/// Remove a single account. If the removed account was the active
+/// one, pick the first remaining account as the new active (or
+/// `None` when this was the last). Deletes the per-account cookies
+/// directory off disk in the same call.
+#[tauri::command]
+async fn remove_account(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let mut idx = read_index(&app).await;
+    let pos = idx
+        .accounts
+        .iter()
+        .position(|a| a.id == id)
+        .ok_or_else(|| format!("no such account: {id}"))?;
+    idx.accounts.remove(pos);
+    let dir = accounts_dir(&app).join(&id);
+    if dir.exists() {
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+    if idx.active.as_deref() == Some(id.as_str()) {
+        idx.active = idx.accounts.first().map(|a| a.id.clone());
+    }
+    write_index(&app, &idx).await?;
+    let _ = app.emit("accounts-changed", ());
+    Ok(())
+}
+
+/// Backfill or update meta for an account. Frontend calls this once
+/// per session after `/account_menu` returns the active user's name
+/// + email + avatar.
+///
+/// Dedup: if the supplied identity (email, or avatar when the email is
+/// empty) matches a *different* existing account, this is a re-login of
+/// an account we've seen before. Replace the older account's cookies
+/// with the freshly-captured ones, drop this account's just-created
+/// entry, and pin the older id as active.
+#[tauri::command]
+async fn update_account_meta(
+    app: tauri::AppHandle,
+    id: String,
+    name: String,
+    email: String,
+    #[allow(non_snake_case)] photoUrl: Option<String>,
+) -> Result<(), String> {
+    let photo_url = photoUrl;
+    let mut idx = read_index(&app).await;
+
+    // Meta from /account_menu always describes the ACTIVE account: the
+    // fetch runs with the active jar. A caller that pairs a stale id
+    // with fresh meta (or a fresh id with stale meta) must not relabel
+    // some other row; with identity dedup that could merge two real
+    // accounts. Drop the write and let the backfill re-run with a
+    // consistent pair.
+    if idx.active.as_deref() != Some(id.as_str()) {
+        return Ok(());
+    }
+
+    // When the account acts as a brand channel, /account_menu describes
+    // the channel, not the Google account, so its meta can't identify a
+    // duplicate row.
+    let acting_as_brand = idx
+        .accounts
+        .iter()
+        .find(|a| a.id == id)
+        .map(|a| a.page_id.is_some())
+        .unwrap_or(false);
+
+    // Re-login of an existing account? Match a *different* row by
+    // identity (email, or avatar when the email is empty; see
+    // `meta_identity`). Keying on email alone missed brand-channel and
+    // no-email accounts, which is how duplicate rows used to pile up.
+    let incoming = if acting_as_brand {
+        None
+    } else {
+        meta_identity(&email, photo_url.as_deref())
+    };
+    let dup_pos = incoming.as_ref().and_then(|key| {
+        idx.accounts.iter().position(|a| {
+            a.id != id
+                && meta_identity(&a.email, a.photo_url.as_deref()).as_deref()
+                    == Some(key.as_str())
+        })
+    });
+
+    // A "fresh add" is the very first meta backfill after
+    // `start_login` — the account row exists but its name + email
+    // are still empty placeholders. That's the moment to fire
+    // `accounts-changed`, because it's the only event the UI listens
+    // to for the full account-switch reset. Subsequent meta refreshes
+    // (every session boot for an existing account) don't trigger the
+    // reset; the frontend just invalidates the accounts list to pick
+    // up name/photo changes.
+    let was_fresh_add = idx
+        .accounts
+        .iter()
+        .find(|a| a.id == id)
+        .map(|a| a.name.is_empty() && a.email.is_empty())
+        .unwrap_or(false);
+
+    // Track whether the active account id actually flips. Dedup is
+    // the only path that flips active here; a plain meta update
+    // leaves `idx.active` alone.
+    let mut active_changed = false;
+
+    if let Some(other_pos) = dup_pos {
+        let other_id = idx.accounts[other_pos].id.clone();
+        let this_cookies = account_cookies_path(&app, &id);
+        let other_cookies = account_cookies_path(&app, &other_id);
+        if let Some(parent) = other_cookies.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Ok(bytes) = tokio::fs::read(&this_cookies).await {
+            if let Err(e) = tokio::fs::write(&other_cookies, bytes).await {
+                eprintln!("[accounts] copy cookies on dedup: {e}");
+            }
+        }
+        let _ = tokio::fs::remove_dir_all(accounts_dir(&app).join(&id)).await;
+        if let Some(this_pos) = idx.accounts.iter().position(|a| a.id == id) {
+            idx.accounts.remove(this_pos);
+        }
+        if let Some(other) = idx.accounts.iter_mut().find(|a| a.id == other_id) {
+            other.name = name;
+            // Don't let an empty backfill (some accounts' /account_menu
+            // carries no email) wipe a good stored email.
+            if !email.is_empty() {
+                other.email = email;
+            }
+            // The avatar can be the dedup identity when the email is
+            // empty; never wipe it with a photo-less response.
+            if photo_url.is_some() {
+                other.photo_url = photo_url;
+            }
+        }
+        if idx.active.as_deref() != Some(other_id.as_str()) {
+            active_changed = true;
+        }
+        idx.active = Some(other_id);
+    } else if let Some(acct) = idx.accounts.iter_mut().find(|a| a.id == id) {
+        if acting_as_brand {
+            // Route brand-channel meta into the channel fields and leave
+            // the account-level identity (name / email / photo captured
+            // on the personal channel) untouched: re-login dedup keys on
+            // it, and overwriting the account photo with the brand one
+            // made a later re-login of the same account look like a new
+            // identity.
+            if !name.is_empty() {
+                acct.channel_name = Some(name);
+            }
+            if photo_url.is_some() {
+                acct.channel_photo_url = photo_url;
+            }
+        } else {
+            acct.name = name;
+            // Some accounts' /account_menu carries no email; don't let
+            // that backfill wipe the stored one (it drives the re-login
+            // dedup above).
+            if !email.is_empty() {
+                acct.email = email;
+            }
+            // The avatar can be the dedup identity when the email is
+            // empty; never wipe it with a photo-less response.
+            if photo_url.is_some() {
+                acct.photo_url = photo_url;
+            }
+        }
+    } else {
+        return Err(format!("no such account: {id}"));
+    }
+
+    write_index(&app, &idx).await?;
+    if was_fresh_add || active_changed {
+        let _ = app.emit("accounts-changed", ());
+    }
+    Ok(())
+}
+
+/// Returns the id of the currently active account, or `None` when
+/// signed out. Frontend uses this to pair fresh `account_menu` info
+/// with the right account row.
+#[tauri::command]
+async fn get_active_account_id(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    Ok(read_index(&app).await.active)
+}
+
+/// Select which YouTube channel (personal or brand) an account acts
+/// as. `pageId: None` selects the personal channel. When the choice on
+/// the ACTIVE account actually changes we emit `accounts-changed`:
+/// library, likes and home are channel-scoped, so the frontend must
+/// run the same full reset as an account switch.
+#[tauri::command]
+async fn set_account_channel(
+    app: tauri::AppHandle,
+    id: String,
+    #[allow(non_snake_case)] pageId: Option<String>,
+    #[allow(non_snake_case)] channelName: Option<String>,
+    #[allow(non_snake_case)] channelPhotoUrl: Option<String>,
+) -> Result<(), String> {
+    let mut idx = read_index(&app).await;
+    let is_active = idx.active.as_deref() == Some(id.as_str());
+    let acct = idx
+        .accounts
+        .iter_mut()
+        .find(|a| a.id == id)
+        .ok_or_else(|| format!("no such account: {id}"))?;
+    let changed = acct.page_id != pageId;
+    acct.page_id = pageId;
+    acct.channel_name = channelName;
+    acct.channel_photo_url = channelPhotoUrl;
+    write_index(&app, &idx).await?;
+    if changed && is_active {
+        let _ = app.emit("accounts-changed", ());
+    }
+    Ok(())
+}
+
+/// Cookie header plus the active account's brand-channel page id in a
+/// single call. The InnerTube client sends the page id back as the
+/// `X-Goog-PageId` header. Bundling it with the cookie read (instead
+/// of a second command) means a cold start can't pair fresh cookies
+/// with a stale page id, or vice versa.
+#[derive(Clone, Debug, serde::Serialize)]
+struct AuthContext {
+    cookie: String,
+    #[serde(rename = "pageId")]
+    page_id: Option<String>,
+}
+
+#[tauri::command]
+async fn get_auth_context(
+    app: tauri::AppHandle,
+    host: String,
+) -> Result<AuthContext, String> {
+    let cookie = read_cookie_header(&app, &host).await;
+    let page_id = if cookie.is_empty() {
+        None
+    } else {
+        let idx = read_index(&app).await;
+        idx.accounts
+            .iter()
+            .find(|a| idx.active.as_deref() == Some(a.id.as_str()))
+            .and_then(|a| a.page_id.clone())
+    };
+    Ok(AuthContext { cookie, page_id })
+}
+
+/// Serializes read-modify-write cycles on the active cookie jar.
+/// Parallel InnerTube responses can each carry Set-Cookie rotations;
+/// without the lock two merges could interleave and drop one.
+#[derive(Default)]
+struct JarWriteLock(tokio::sync::Mutex<()>);
+
+/// Merge `Set-Cookie` headers from an InnerTube response into the
+/// active account's jar, mirroring what a browser would do. Google
+/// rotates session-security cookies (SIDCC / __Secure-*PSIDCC /
+/// LOGIN_INFO) right after sign-in and expects the client to echo the
+/// fresh values from then on; a client that keeps replaying the
+/// pre-rotation snapshot matches the stolen-cookie heuristic and the
+/// whole session gets revoked within hours (the v0.2.0 "library and
+/// Premium vanish" bug).
+///
+/// Returns `true` when a cookie VALUE changed — the frontend drops its
+/// cached Cookie header then. Missing jar / dead decrypt are quiet
+/// no-ops: rotation echo is best-effort and must never break the data
+/// call that triggered it.
+#[tauri::command]
+async fn merge_response_cookies(
+    app: tauri::AppHandle,
+    lock: tauri::State<'_, JarWriteLock>,
+    host: String,
+    set_cookies: Vec<String>,
+) -> Result<bool, String> {
+    if set_cookies.is_empty() {
+        return Ok(false);
+    }
+    let _guard = lock.0.lock().await;
+    let Some(path) = active_cookies_path(&app).await else {
+        return Ok(false);
+    };
+    let Ok(encrypted) = tokio::fs::read(&path).await else {
+        return Ok(false);
+    };
+    let Ok(Ok(plain)) =
+        tokio::task::spawn_blocking(move || secure_store::decrypt(&encrypted)).await
+    else {
+        return Ok(false);
+    };
+    let Ok(jar) = String::from_utf8(plain) else {
+        return Ok(false);
+    };
+
+    let now_ts = time::OffsetDateTime::now_utc().unix_timestamp();
+    let merged = merge_set_cookies_into_jar(&jar, &set_cookies, &host, now_ts);
+
+    // An identity cookie the server tried to expire. We did not apply
+    // it (see PROTECTED_COOKIES): one response must not be able to
+    // hard-log the user out — a rejection carrying a sign-out burst
+    // (or a plain 4xx that echoes one) is not evidence that the
+    // account signed out. Surface it to the frontend so it re-checks
+    // the live session; if it is really gone, the check reports that.
+    if !merged.blocked_deletions.is_empty() {
+        eprintln!(
+            "[auth] refused server expiry of identity cookie(s) {:?} from {host}",
+            merged.blocked_deletions
+        );
+        let _ = app.emit("session-refreshed", ());
+    }
+
+    // The merge still honors deletions for non-identity cookies, which
+    // is correct browser behavior. It has never been logged, so we
+    // have no idea how often it fires in the field. Report it.
+    for gone in jar_cookie_keys(&jar).difference(&jar_cookie_keys(&merged.jar)) {
+        eprintln!("[auth] server expired cookie {gone} (response host {host})");
+    }
+
+    if !merged.needs_write {
+        return Ok(false);
+    }
+    let value_changed = merged.value_changed;
+    let bytes = merged.jar.into_bytes();
+    let encrypted = tokio::task::spawn_blocking(move || secure_store::encrypt(&bytes))
+        .await
+        .map_err(|e| format!("encrypt join: {e}"))?
+        .map_err(|e| format!("encrypt cookies: {e}"))?;
+    // Write-then-rename: this path now runs on live rotations, not just
+    // at login, and a torn cookies.enc reads as "signed out".
+    write_atomic(&path, &encrypted)
+        .await
+        .map_err(|e| format!("write jar: {e}"))?;
+    if value_changed {
+        eprintln!("[auth] echoed rotated session cookie(s) into the active jar");
+        // The fork's snapshot-renewal path. The keeper that upstream
+        // emits `session-refreshed` from does not exist here; the
+        // rotation echo is what keeps the jar fresh instead, so it is
+        // the moment the frontend should re-check a session it may
+        // have given up on.
+        let _ = app.emit("session-refreshed", ());
+    }
+    Ok(value_changed)
+}
+
+/// `domain name` keys for every entry in a Netscape jar, so two jars
+/// can be diffed to see what a merge added or dropped.
+fn jar_cookie_keys(jar: &str) -> std::collections::HashSet<String> {
+    jar.lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f.len() >= 7).then(|| format!("{} {}", f[0], f[5]))
+        })
+        .collect()
+}
+
+/// File (under the store plugin's default dir) + key holding the
+/// user-chosen cache root. Written by `set_cache_dir`, read once at
+/// startup — the stream server captures its directories when it
+/// spawns, so a change only applies on the next launch.
+const SETTINGS_STORE_FILE: &str = "settings.json";
+const CACHE_DIR_KEY: &str = "cacheDir";
+
+/// The cache root this process actually started with (managed state,
+/// set in `setup`). All track/cover cache paths derive from it so the
+/// commands and the running stream server always agree, even when the
+/// stored preference already points somewhere new.
+struct ActiveCacheRoot(PathBuf);
+
+fn default_cache_root(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+/// User-chosen cache root from the settings store, if any.
+fn stored_cache_root(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri_plugin_store::StoreExt;
+    let store = app.store(SETTINGS_STORE_FILE).ok()?;
+    let value = store.get(CACHE_DIR_KEY)?;
+    let s = value.as_str()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
+}
+
+fn stream_cache_dir(app: &tauri::AppHandle) -> PathBuf {
+    app.state::<ActiveCacheRoot>().0.join("stream")
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CacheDirInfo {
+    /// Root that will be used from the next launch on.
+    path: String,
+    default_path: String,
+    is_custom: bool,
+    /// True when the stored preference differs from what this process
+    /// is running with — i.e. a restart is pending.
+    needs_restart: bool,
+}
+
+#[tauri::command]
+fn get_cache_dir(app: tauri::AppHandle) -> CacheDirInfo {
+    let default = default_cache_root(&app);
+    let stored = stored_cache_root(&app);
+    let active = app.state::<ActiveCacheRoot>().0.clone();
+    let effective = stored.clone().unwrap_or_else(|| default.clone());
+    CacheDirInfo {
+        needs_restart: effective != active,
+        path: effective.display().to_string(),
+        default_path: default.display().to_string(),
+        is_custom: stored.is_some(),
+    }
+}
+
+/// Persist a new cache root (`None` resets to the default). Validates
+/// that the folder exists and is writable before saving; the change
+/// takes effect on the next launch.
+#[tauri::command]
+async fn set_cache_dir(
+    app: tauri::AppHandle,
+    path: Option<String>,
+) -> Result<(), String> {
+    use tauri_plugin_store::StoreExt;
+    let store = app
+        .store(SETTINGS_STORE_FILE)
+        .map_err(|e| format!("open settings store: {e}"))?;
+    match path {
+        None => {
+            store.delete(CACHE_DIR_KEY);
+        }
+        Some(raw) => {
+            let raw = raw.trim().to_string();
+            let dir = PathBuf::from(&raw);
+            if raw.is_empty() || !dir.is_absolute() {
+                return Err("Pick an absolute folder path.".into());
+            }
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(|e| format!("Can't create the folder: {e}"))?;
+            let probe = dir.join(".ytubic-write-test");
+            tokio::fs::write(&probe, b"ok")
+                .await
+                .map_err(|e| format!("Folder isn't writable: {e}"))?;
+            let _ = tokio::fs::remove_file(&probe).await;
+            store.set(CACHE_DIR_KEY, serde_json::Value::String(raw));
+        }
+    }
+    store.save().map_err(|e| format!("save settings store: {e}"))?;
+    Ok(())
+}
+
+/// Native directory picker for the cache-folder setting. Returns
+/// `None` when the user cancels. Blocking picker variant, so keep it
+/// off the async runtime's core threads.
+#[tauri::command]
+async fn pick_cache_folder(app: tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog().file().blocking_pick_folder()
+    })
+    .await
+    .ok()
+    .flatten()
+    .and_then(|f| f.into_path().ok())
+    .map(|p| p.display().to_string())
+}
+
+/// Default size cap for the persistent track cache when the user hasn't
+/// set one. Caching now runs for every user (not just Premium), so an
+/// unbounded default would let the cache grow until the disk fills;
+/// 5 GiB is a comfortable "few hundred tracks" floor the user can raise
+/// or drop to unlimited from Settings.
+const DEFAULT_CACHE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Extensions `enforce_cache_limit` treats as belonging to the audio
+/// stream cache.
+const AUDIO_CACHE_EXTENSIONS: &[&str] = &[".webm"];
+
+/// Fixed size cap for the cover-image disk cache (`cover_cache_dir`).
+/// Unlike the audio cache this isn't user-configurable from Settings —
+/// covers are small (roughly 1-3 MB each for the upgraded hi-res iTunes
+/// art) and the point is just to stop unbounded growth, not to let users
+/// trade off disk for cache depth the way they do for tracks. ~512 MiB
+/// comfortably covers many hundreds of distinct covers.
+const DEFAULT_COVER_CACHE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Extensions `enforce_cache_limit` treats as belonging to the cover
+/// cache — matches every extension `url_to_filename` can produce.
+const COVER_CACHE_EXTENSIONS: &[&str] = &[".jpg", ".png", ".webp"];
+
+/// Where the persisted cache-size limit lives (plain integer bytes,
+/// `0` = unlimited). Kept next to the accounts data in app-data so it
+/// survives cache clears.
+fn cache_limit_path(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("cache-limit")
+}
+
+/// Read the persisted cache limit, falling back to the default when the
+/// file is missing or unparseable.
+async fn read_cache_limit(app: &tauri::AppHandle) -> u64 {
+    match tokio::fs::read_to_string(cache_limit_path(app)).await {
+        Ok(s) => s.trim().parse().unwrap_or(DEFAULT_CACHE_LIMIT_BYTES),
+        Err(_) => DEFAULT_CACHE_LIMIT_BYTES,
+    }
+}
+
+/// Persist the cache limit so it survives restarts.
+async fn write_cache_limit(app: &tauri::AppHandle, bytes: u64) -> Result<(), String> {
+    let path = cache_limit_path(app);
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| format!("mkdir: {e}"))?;
+    }
+    tokio::fs::write(&path, bytes.to_string())
+        .await
+        .map_err(|e| format!("write cache-limit: {e}"))
+}
+
+/// Evict oldest files (by mtime) from `dir` until the total size of files
+/// matching `extensions` is at or under `limit`. `limit == 0` means
+/// unlimited (no-op). Only files whose name ends with one of `extensions`
+/// are counted and eligible for eviction — in-flight `.part` downloads
+/// (which never match) are left alone. Deleting a file that's currently
+/// being served is safe: on Unix the open handle keeps the bytes readable
+/// until the stream finishes, and on Windows the delete simply fails and
+/// is retried on the next download.
+///
+/// Shared by the audio stream cache (`.webm`) and the cover-image cache
+/// (`.jpg`/`.png`/`.webp`) — same growth shape (one file per unique key,
+/// no natural upper bound without this), same fix.
+async fn enforce_cache_limit(dir: PathBuf, limit: u64, extensions: &[&str]) {
+    if limit == 0 {
+        return;
+    }
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let matches_ext = e
+            .file_name()
+            .to_str()
+            .map(|n| extensions.iter().any(|ext| n.ends_with(ext)))
+            .unwrap_or(false);
+        if !matches_ext {
+            continue;
+        }
+        let Ok(meta) = e.metadata().await else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        total += meta.len();
+        files.push((e.path(), meta.len(), mtime));
+    }
+    if total <= limit {
+        return;
+    }
+    // Oldest first — least-recently-finalized tracks are evicted before
+    // fresher ones.
+    files.sort_by_key(|(_, _, mtime)| *mtime);
+    for (path, size, _) in files {
+        if total <= limit {
+            break;
+        }
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            total = total.saturating_sub(size);
+            eprintln!("[cache] evicted {path:?} ({size} bytes) to honor {limit}-byte limit");
+        }
+    }
+}
+
+/// Return the active persistent-cache size limit in bytes (`0` =
+/// unlimited). The value is authoritative from the shared atomic, which
+/// `run()` seeds from the persisted file on startup.
+#[tauri::command]
+async fn get_cache_limit(
+    state: tauri::State<'_, StreamServerState>,
+) -> Result<u64, String> {
+    Ok(state.cache_limit.load(Ordering::Relaxed))
+}
+
+/// Update the persistent-cache size limit, persist it, and immediately
+/// evict down to the new ceiling. `bytes == 0` disables the cap.
+#[tauri::command]
+async fn set_cache_limit(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, StreamServerState>,
+    bytes: u64,
+) -> Result<(), String> {
+    state.cache_limit.store(bytes, Ordering::Relaxed);
+    write_cache_limit(&app, bytes).await?;
+    enforce_cache_limit(stream_cache_dir(&app), bytes, AUDIO_CACHE_EXTENSIONS).await;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct CacheEntry {
+    #[serde(rename = "videoId")]
+    video_id: String,
+    size: u64,
+    /// Seconds since unix epoch. Frontend formats for display.
+    #[serde(rename = "modifiedSecs")]
+    modified_secs: u64,
+}
+
+/// List every finalized track (.webm) currently in the stream cache.
+/// In-progress .part files are ignored — they'll appear once the
+/// download finishes and the rename happens.
+#[tauri::command]
+async fn list_cache(app: tauri::AppHandle) -> Result<Vec<CacheEntry>, String> {
+    let dir = stream_cache_dir(&app);
+    let mut entries: Vec<CacheEntry> = Vec::new();
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+        Err(e) => return Err(format!("read_dir: {e}")),
+    };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        let Some(video_id) = name.strip_suffix(".webm") else {
+            continue;
+        };
+        if !sanitize_video_id(video_id) {
+            continue;
+        }
+        let Ok(meta) = e.metadata().await else { continue };
+        let modified_secs = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        entries.push(CacheEntry {
+            video_id: video_id.to_string(),
+            size: meta.len(),
+            modified_secs,
+        });
+    }
+    Ok(entries)
+}
+
+/// Delete specific cached tracks. Passing an empty vec wipes the
+/// entire stream cache directory. Returns the total bytes freed.
+#[tauri::command]
+async fn delete_cache_entries(
+    app: tauri::AppHandle,
+    video_ids: Vec<String>,
+) -> Result<u64, String> {
+    let dir = stream_cache_dir(&app);
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut freed: u64 = 0;
+
+    let targets: Vec<String> = if video_ids.is_empty() {
+        // "Clear all" — enumerate on the fly.
+        let mut rd = tokio::fs::read_dir(&dir)
+            .await
+            .map_err(|e| format!("read_dir: {e}"))?;
+        let mut out = Vec::new();
+        while let Ok(Some(e)) = rd.next_entry().await {
+            if let Some(name) = e.file_name().to_str() {
+                if let Some(id) = name.strip_suffix(".webm") {
+                    if sanitize_video_id(id) {
+                        out.push(id.to_string());
+                    }
+                }
+            }
+        }
+        out
+    } else {
+        video_ids
+            .into_iter()
+            .filter(|id| sanitize_video_id(id))
+            .collect()
+    };
+
+    for id in targets {
+        let path = dir.join(format!("{id}.webm"));
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            freed += meta.len();
+        }
+        let _ = tokio::fs::remove_file(&path).await;
+        // Stray .part file from a crashed download, if any.
+        let _ = tokio::fs::remove_file(dir.join(format!("{id}.part"))).await;
+    }
+    Ok(freed)
+}
+
+/// Make the managed yt-dlp binary available (download on first run,
+/// throttled self-update after). Invoked by the frontend on mount so
+/// the `ytdlp-state` event listener is guaranteed to exist before any
+/// state event fires; also serves as the retry path after a failed
+/// download. Idempotent — see `ytdlp::ensure`.
+#[tauri::command]
+async fn ensure_ytdlp(app: tauri::AppHandle) {
+    ytdlp::ensure(app).await;
+}
+
+/// Throttled update check for a process that remains alive in the tray.
+#[tauri::command]
+async fn check_ytdlp_update(app: tauri::AppHandle) {
+    ytdlp::check_update(app).await;
+}
+
+/// Run yt-dlp to resolve a videoId into metadata JSON.
+#[tauri::command]
+fn resolve_stream_ytdlp(app: tauri::AppHandle, video_id: String) -> Result<String, String> {
+    if !sanitize_video_id(&video_id) {
+        return Err(format!("invalid videoId: {video_id}"));
+    }
+    let url = format!("https://www.youtube.com/watch?v={video_id}");
+    let mut command = std::process::Command::new(ytdlp::program(&ytdlp::managed_path(&app)));
+    command.args([
+        "-j",
+        // Progressive only: the resolved URL is handed straight to an
+        // <audio> element, which can't play the m3u8 formats some
+        // clients now advertise (and we ship no ffmpeg to remux them).
+        // Trailing /best keeps combined-mp4-only videos (format 18)
+        // playable (already sniffed and served as audio/mp4).
+        "-f",
+        "bestaudio[ext=webm][protocol^=http]/bestaudio[protocol^=http]/bestaudio/best",
+        "--no-playlist",
+        "--no-warnings",
+        &url,
+    ]);
+    // Windows: a console-less GUI process spawning the console-subsystem
+    // yt-dlp.exe with default flags makes Windows flash a console window
+    // on every resolve. CREATE_NO_WINDOW suppresses it.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let output = command
+        .output()
+        .map_err(|e| format!("spawn yt-dlp: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "yt-dlp exit {}: {}",
+            output.status,
+            stderr.chars().take(400).collect::<String>()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("stdout not utf8: {e}"))
+}
+
+/// Lifecycle of a single track's yt-dlp download. yt-dlp writes
+/// bytes into a `<videoId>.part` file which is renamed to
+/// `<videoId>.webm` on successful completion; stream handlers block on
+/// `notify` until `complete` flips.
+struct DownloadState {
+    complete: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+type DownloadMap = Arc<Mutex<HashMap<String, Arc<DownloadState>>>>;
+
+// NB: streaming is anonymous BY DEFAULT. YouTube's bot-detection treats
+// an authenticated request through a non-browser player client as a bot
+// — it can't produce a PO token, so it looks like an account scraping —
+// and strips every real audio format, leaving only storyboard thumbnails.
+// Anonymous streaming avoids that entirely and is the primary path.
+//
+// Nor do we pin `--extractor-args youtube:player_client=...` any more.
+// YouTube keeps taking clients away (as of 2026-08 `tv` is SABR-only and
+// `android_vr`/`ios`/`mweb` need a GVS PO token, so the old
+// `tv,android_vr`/`tv,android` pins resolved to zero audio formats and
+// every uncached track failed). yt-dlp's own default client list is the
+// thing upstream keeps working, and the managed binary self-updates, so
+// pinning here only opts us out of those fixes.
+//
+// The one exception is age-restricted videos: those can't be played
+// anonymously at all (no client-only bypass survives in current yt-dlp).
+// For those we retry once WITH the signed-in account's cookies — the
+// cookies supply the account's age confirmation — so cookies are used
+// surgically, only when the anonymous attempt fails with the age-gate
+// error. See `spawn_downloader`.
+#[derive(Clone)]
+struct StreamServer {
+    /// App handle, used solely to decrypt the active account's cookie jar
+    /// for the age-gated retry path (`write_temp_cookies`).
+    app: tauri::AppHandle,
+    /// Persistent cache. Tracks land here for Premium-authenticated
+    /// users and stay across app restarts.
+    cache_dir: PathBuf,
+    /// Session-only cache for anonymous / Free users. Wiped on every
+    /// app startup (see `start_stream_server`) so a non-Premium session
+    /// never accumulates a track library on disk. The `download` map
+    /// keys are prefixed (`e:` vs `p:`) so the same videoId can be
+    /// in-flight independently for the two modes.
+    ephemeral_dir: PathBuf,
+    cover_dir: PathBuf,
+    downloads: DownloadMap,
+    /// Expected location of the managed yt-dlp copy. Resolution to an
+    /// actual program (managed vs PATH fallback) happens per-spawn via
+    /// `ytdlp::program` so a mid-session download takes effect
+    /// immediately.
+    ytdlp_bin: PathBuf,
+    /// Max total bytes the persistent cache may occupy before oldest
+    /// tracks get evicted. `0` means unlimited. Shared (Arc) with
+    /// `StreamServerState` so the `set_cache_limit` command updates it
+    /// live without restarting the server.
+    cache_limit: Arc<AtomicU64>,
+}
+
+/// Read the `ephemeral` query flag from a stream/prefetch request.
+/// True when `?ephemeral=1` (or `=true`) appears — used to route the
+/// download to `ephemeral_dir` instead of the persistent cache.
+fn is_ephemeral(req: &Request) -> bool {
+    let Some(query) = req.uri().query() else {
+        return false;
+    };
+    query.split('&').any(|kv| {
+        let mut it = kv.splitn(2, '=');
+        let key = it.next().unwrap_or("");
+        let val = it.next().unwrap_or("");
+        key == "ephemeral" && (val == "1" || val == "true")
+    })
+}
+
+/// Hash a URL into a stable hex filename. Uses Rust's stdlib
+/// SipHash13 (DefaultHasher) — not cryptographic, but for cache-key
+/// purposes only and keeps the dependency footprint small.
+fn url_to_filename(url: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+    let ext = if url.contains(".png") {
+        "png"
+    } else if url.contains(".webp") {
+        "webp"
+    } else {
+        "jpg"
+    };
+    format!("{hash}.{ext}")
+}
+
+fn cover_cache_dir(app: &tauri::AppHandle) -> PathBuf {
+    app.state::<ActiveCacheRoot>().0.join("covers")
+}
+
+/// SSRF guard for cover fetches: cover URLs come from remote metadata
+/// (iTunes/mzstatic + YT image hosts). Only https from those known CDNs
+/// is fetchable, so a crafted metadata field can't point the server-side
+/// fetch at an internal service (e.g. 169.254.169.254 or a LAN admin
+/// page). Callers must also disable redirects so a CDN-looking URL can't
+/// 302 into the allowlist.
+fn check_cover_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("bad url: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!("blocked scheme: {}", parsed.scheme()));
+    }
+    const ALLOWED_HOST_SUFFIXES: &[&str] = &[
+        "mzstatic.com",
+        "ytimg.com",
+        "ggpht.com",
+        "googleusercontent.com",
+    ];
+    let host = parsed.host_str().unwrap_or("");
+    let host_ok = ALLOWED_HOST_SUFFIXES
+        .iter()
+        .any(|s| host == *s || host.ends_with(&format!(".{s}")));
+    if !host_ok {
+        return Err(format!("blocked cover host: {host}"));
+    }
+    Ok(())
+}
+
+/// Fetch cover bytes from an allowlisted CDN. Shared by the disk cache
+/// and the user-facing "Download cover" action.
+async fn fetch_cover_bytes(url: &str) -> Result<Vec<u8>, String> {
+    check_cover_url(url)?;
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("client: {e}"))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("fetch: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("read body: {e}"))
+}
+
+/// Strip everything Windows/macOS/Linux disallow in a file name, plus
+/// leading dots (hidden files) and trailing dots/spaces (Windows trims
+/// those and would land us on a different path than we report back).
+fn sanitize_file_stem(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    // Keep well under MAX_PATH / 255-byte name limits once the extension
+    // and a possible " (2)" suffix are appended. Truncate on a char
+    // boundary so multi-byte titles don't panic.
+    let capped: String = trimmed.chars().take(120).collect();
+    let capped = capped.trim().to_string();
+    if capped.is_empty() {
+        "cover".to_string()
+    } else {
+        capped
+    }
+}
+
+/// Pick a `dir/<stem>.<ext>` path that doesn't exist yet, appending
+/// " (2)", " (3)", … the way a browser's download manager does.
+fn unique_download_path(dir: &std::path::Path, stem: &str, ext: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.{ext}"));
+    if !first.exists() {
+        return first;
+    }
+    for n in 2..1000 {
+        let candidate = dir.join(format!("{stem} ({n}).{ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+/// Save the now-playing cover art to the user's Downloads folder.
+/// `url` is the remote CDN URL (iTunes studio art when we found one,
+/// otherwise the largest YT thumbnail); `filename` is the desired stem
+/// without an extension ("Artist - Title"), sanitized here.
+///
+/// Returns the full path written, which the UI shows in a toast.
+#[tauri::command]
+async fn download_cover(
+    app: tauri::AppHandle,
+    url: String,
+    filename: String,
+) -> Result<String, String> {
+    let bytes = fetch_cover_bytes(&url).await?;
+
+    let dir = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("no downloads folder: {e}"))?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("mkdir: {e}"))?;
+
+    // `url_to_filename` already maps a cover URL to png/webp/jpg.
+    let ext = url_to_filename(&url)
+        .rsplit('.')
+        .next()
+        .unwrap_or("jpg")
+        .to_string();
+    let path = unique_download_path(&dir, &sanitize_file_stem(&filename), &ext);
+
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Download a cover image (typically from iTunes / mzstatic) and stash
+/// it in the local cover cache, returning a localhost URL the webview
+/// can use as `<img src>`. Subsequent calls for the same URL skip the
+/// network and just return the existing local URL.
+///
+/// We don't cache failures — the next track switch retries.
+#[tauri::command]
+async fn cache_cover(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, StreamServerState>,
+    url: String,
+) -> Result<String, String> {
+    let port = {
+        let p = state.port.lock().await;
+        p.ok_or_else(|| "stream server not ready".to_string())?
+    };
+    let token = {
+        let t = state.token.lock().await;
+        t.clone().ok_or_else(|| "stream server not ready".to_string())?
+    };
+
+    check_cover_url(&url)?;
+
+    let dir = cover_cache_dir(&app);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("mkdir: {e}"))?;
+
+    let filename = url_to_filename(&url);
+    let path = dir.join(&filename);
+
+    if !path.exists() {
+        let bytes = fetch_cover_bytes(&url).await?;
+        // Write to a .part file then atomically rename so a concurrent
+        // reader never sees a half-written file.
+        let part = path.with_extension(format!(
+            "{}.part",
+            path.extension().and_then(|e| e.to_str()).unwrap_or("")
+        ));
+        tokio::fs::write(&part, &bytes)
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+        tokio::fs::rename(&part, &path)
+            .await
+            .map_err(|e| format!("rename: {e}"))?;
+
+        // Fire-and-forget: keep the cover cache under its cap without
+        // delaying this command's return — the webview is waiting on the
+        // URL below to render the image, so eviction shouldn't block it.
+        // Same non-blocking shape as the in-memory download-map eviction
+        // in `spawn_downloader`.
+        let evict_dir = dir.clone();
+        tokio::spawn(async move {
+            enforce_cache_limit(
+                evict_dir,
+                DEFAULT_COVER_CACHE_LIMIT_BYTES,
+                COVER_CACHE_EXTENSIONS,
+            )
+            .await;
+        });
+    }
+
+    Ok(format!("http://127.0.0.1:{port}/{token}/cover/{filename}"))
+}
+
+#[derive(serde::Serialize)]
+struct CoverCacheStats {
+    count: u64,
+    bytes: u64,
+}
+
+/// Sum up the cover cache directory. Used by the Settings UI to show
+/// "Covers: 47 files, 12 MB" alongside the existing track-cache row.
+#[tauri::command]
+async fn cover_cache_stats(app: tauri::AppHandle) -> Result<CoverCacheStats, String> {
+    let dir = cover_cache_dir(&app);
+    let mut count: u64 = 0;
+    let mut bytes: u64 = 0;
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CoverCacheStats { count: 0, bytes: 0 });
+        }
+        Err(e) => return Err(format!("read_dir: {e}")),
+    };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let Ok(meta) = e.metadata().await else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        count += 1;
+        bytes += meta.len();
+    }
+    Ok(CoverCacheStats { count, bytes })
+}
+
+/// Wipe every file in the cover cache directory. Returns total bytes
+/// freed. The directory itself is preserved so the next `cache_cover`
+/// call doesn't have to recreate it.
+#[tauri::command]
+async fn clear_cover_cache(app: tauri::AppHandle) -> Result<u64, String> {
+    let dir = cover_cache_dir(&app);
+    let mut freed: u64 = 0;
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("read_dir: {e}")),
+    };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let Ok(meta) = e.metadata().await else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        freed += meta.len();
+        let _ = tokio::fs::remove_file(e.path()).await;
+    }
+    Ok(freed)
+}
+
+#[derive(Default)]
+struct StreamServerState {
+    port: Arc<Mutex<Option<u16>>>,
+    /// Per-launch secret used as a path prefix on every stream/prefetch/
+    /// cover URL. The frontend gets it baked into the base URL, so it's
+    /// transparent to the webview; a web page in the user's browser that
+    /// guesses the random port still can't form a valid URL — this closes
+    /// the CSRF-spawn and DNS-rebinding-read vectors.
+    token: Arc<Mutex<Option<String>>>,
+    /// Persistent-cache size cap in bytes (`0` = unlimited). Shared with
+    /// the running `StreamServer` so `set_cache_limit` takes effect on
+    /// the next download without a restart. Seeded from disk in `run()`.
+    cache_limit: Arc<AtomicU64>,
+}
+
+#[tauri::command]
+async fn get_stream_base_url(
+    state: tauri::State<'_, StreamServerState>,
+) -> Result<String, String> {
+    let port = *state.port.lock().await;
+    let token = state.token.lock().await.clone();
+    match (port, token) {
+        (Some(p), Some(t)) => Ok(format!("http://127.0.0.1:{p}/{t}")),
+        _ => Err("stream server not ready".to_string()),
+    }
+}
+
+/// Outcome of a single yt-dlp invocation in `download_attempt`.
+struct AttemptOutcome {
+    /// The child exited 0 and we streamed its full stdout without error.
+    ok: bool,
+    /// stderr carried YouTube's age-confirmation signature — the caller
+    /// may retry with cookies.
+    age_gated: bool,
+}
+
+/// A private, self-deleting Netscape cookie jar for yt-dlp's `--cookies`.
+/// The file is removed when this guard drops.
+struct TempCookies {
+    path: PathBuf,
+}
+
+impl TempCookies {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempCookies {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Decrypt the active account's cookie jar (already Netscape format) into
+/// a `0600` temp file that yt-dlp can read via `--cookies`. Returns
+/// `None` when nobody is signed in or decryption fails — i.e. there's no
+/// authentication to attempt.
+async fn write_temp_cookies(app: &tauri::AppHandle) -> Option<TempCookies> {
+    let netscape = read_cookies_plain(app).await?;
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let path = dir.join(format!("ytdlp-cookies-{}.txt", generate_stream_token()));
+
+    // Create with restrictive perms up front (no world-readable window)
+    // and write synchronously — the jar is tiny and holds real auth
+    // tokens, so we don't leave it lying around readable.
+    let write_path = path.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&write_path)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&write_path)?;
+        f.write_all(netscape.as_bytes())?;
+        f.flush()
+    })
+    .await
+    .ok()?
+    .ok()?;
+
+    Some(TempCookies { path })
+}
+
+/// Run yt-dlp once for `url`, streaming stdout into `part_path` (created
+/// fresh) and pinging `state.notify` on each chunk. `format` is the `-f`
+/// selector; `cookies`, when set, is passed via `--cookies`. Returns whether
+/// it succeeded and whether stderr showed the age-gate error so the caller
+/// can decide to retry.
+async fn download_attempt(
+    program: &std::path::Path,
+    url: &str,
+    part_path: &std::path::Path,
+    format: &str,
+    cookies: Option<&std::path::Path>,
+    state: &Arc<DownloadState>,
+) -> AttemptOutcome {
+    let mut cmd = TokioCommand::new(program);
+    cmd.arg("-f");
+    cmd.arg(format);
+    cmd.args([
+        "--no-playlist",
+        "--no-warnings",
+        "--no-part",
+        "-q",
+        // YouTube regularly hands out a signed media URL that then 403s
+        // on the very first byte-range request (token/pot desync or
+        // per-URL throttling). Left alone this surfaces as a one-off
+        // "download failed" that a manual re-click fixes. Retrying the
+        // data download and the extractor a few times clears the vast
+        // majority of these inside a single spawn, before the handler
+        // ever returns 502 to the audio element.
+        "--retries",
+        "5",
+        "--extractor-retries",
+        "3",
+        "--socket-timeout",
+        "15",
+    ]);
+    if let Some(c) = cookies {
+        cmd.arg("--cookies").arg(c);
+    }
+    cmd.args(["-o", "-"]);
+    cmd.arg(url);
+    // Windows: suppress the console window for the child yt-dlp.exe.
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+    // stderr is piped (not inherited) so we can scan it for the age-gate
+    // signature; we still echo it afterwards to preserve the old logging.
+    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[stream] spawn yt-dlp: {e}");
+            return AttemptOutcome {
+                ok: false,
+                age_gated: false,
+            };
+        }
+    };
+
+    let mut stdout = child.stdout.take().unwrap();
+    // Drain stderr concurrently — a full pipe buffer would otherwise
+    // deadlock a chatty yt-dlp against our stdout read loop.
+    let stderr = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut e) = stderr {
+            let _ = e.read_to_end(&mut buf).await;
+        }
+        buf
+    });
+
+    let mut file = tokio::fs::File::create(part_path).await.ok();
+    let mut read_buf = vec![0u8; 64 * 1024];
+    let mut ok = true;
+    // Per-read timeout so a wedged yt-dlp (stalled TCP / hung extractor)
+    // can't keep this task and the child process alive forever.
+    const READ_TIMEOUT: Duration = Duration::from_secs(60);
+    loop {
+        match tokio::time::timeout(READ_TIMEOUT, stdout.read(&mut read_buf)).await {
+            Err(_) => {
+                eprintln!("[stream] read timeout; killing yt-dlp");
+                let _ = child.start_kill();
+                ok = false;
+                break;
+            }
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                let chunk = &read_buf[..n];
+                if let Some(ref mut f) = file {
+                    if let Err(e) = f.write_all(chunk).await {
+                        eprintln!("[stream] write .part: {e}");
+                        file = None;
+                        // A truncated prefix must NOT be renamed to .webm
+                        // and cached — mark the whole download failed.
+                        ok = false;
+                    }
+                }
+                state.notify.notify_waiters();
+            }
+            Ok(Err(e)) => {
+                eprintln!("[stream] read stdout: {e}");
+                ok = false;
+                break;
+            }
+        }
+    }
+    if let Some(mut f) = file.take() {
+        let _ = f.flush().await;
+        drop(f);
+    }
+    let status = child.wait().await;
+    let success = ok && status.map(|s| s.success()).unwrap_or(false);
+
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    if !stderr_str.trim().is_empty() {
+        eprint!("{stderr_str}");
+    }
+    // yt-dlp's age-gate line: "Sign in to confirm your age. This video may
+    // be inappropriate for some users." Match on stable substrings.
+    let age_gated = stderr_str.contains("confirm your age")
+        || stderr_str.contains("Sign in to confirm you");
+
+    AttemptOutcome {
+        ok: success,
+        age_gated,
+    }
+}
+
+/// Spawn a yt-dlp downloader that writes into the shared memory buffer
+/// AND to a `<videoId>.part` file on disk. On successful exit, renames
+/// .part → .webm. Updates `state.complete` + pings `notify` on every
+/// new chunk.
+///
+/// `target_dir` selects which on-disk pool to write to (persistent or
+/// ephemeral). `map_key` is the prefixed key in `srv.downloads` so a
+/// single videoId can be in-flight independently for both pools.
+fn spawn_downloader(
+    video_id: String,
+    target_dir: PathBuf,
+    map_key: String,
+    srv: StreamServer,
+    state: Arc<DownloadState>,
+) {
+    let downloads = srv.downloads.clone();
+    tokio::spawn(async move {
+        let url = format!("https://www.youtube.com/watch?v={video_id}");
+        let part_path = target_dir.join(format!("{video_id}.part"));
+        let final_path = target_dir.join(format!("{video_id}.webm"));
+        let _ = tokio::fs::create_dir_all(&target_dir).await;
+        let _ = tokio::fs::remove_file(&part_path).await; // clean stale
+
+        let program = ytdlp::program(&srv.ytdlp_bin);
+
+        // Primary attempt: anonymous with yt-dlp's default clients (see
+        // StreamServer note). Progressive http only — the bytes are
+        // handed to an <audio> element via the localhost proxy.
+        // Trailing /best keeps combined-mp4-only videos playable.
+        const AUDIO_FORMAT: &str =
+            "bestaudio[ext=webm][protocol^=http]/bestaudio[protocol^=http]/bestaudio/best";
+        let mut attempt =
+            download_attempt(&program, &url, &part_path, AUDIO_FORMAT, None, &state).await;
+
+        // Age-restricted videos can't be streamed anonymously. If the
+        // anonymous attempt failed specifically with the age-gate error and
+        // an account is signed in, retry once with that account's cookies.
+        // No client pin (same default list as the anonymous path) — the
+        // cookies supply the account's age confirmation. A trailing `/best`
+        // guards against a client that omits an audio-only format on the
+        // authenticated path.
+        if !attempt.ok && attempt.age_gated {
+            match write_temp_cookies(&srv.app).await {
+                Some(cookies) => {
+                    eprintln!(
+                        "[stream] {video_id} is age-restricted; retrying with account cookies"
+                    );
+                    attempt = download_attempt(
+                        &program,
+                        &url,
+                        &part_path,
+                        "bestaudio[ext=webm][protocol^=http]/bestaudio[protocol^=http]/bestaudio/best",
+                        Some(cookies.path()),
+                        &state,
+                    )
+                    .await;
+                    // `cookies` (temp jar) is removed here on drop.
+                }
+                None => {
+                    eprintln!(
+                        "[stream] {video_id} is age-restricted but no account is signed in — cannot play"
+                    );
+                }
+            }
+        }
+
+        let success = attempt.ok;
+
+        // Finish all file operations BEFORE signalling completion.
+        // Otherwise handlers waiting on `state.complete` can race and
+        // observe `final_path.exists() == false` in the tiny window
+        // between yt-dlp exit and our rename, returning 502 even
+        // though the download succeeded.
+        // 32 KB floor: yt-dlp can exit 0 with a near-empty payload when
+        // YouTube serves a storyboard-only response (rate-limit, geo-block,
+        // SABR fallout). Renaming such a stub to .webm would pin a
+        // permanently-broken cache entry that fails MEDIA_ERR_DECODE on
+        // every replay — drop it instead so the next request retries.
+        const MIN_AUDIO_BYTES: u64 = 32 * 1024;
+        let part_size = tokio::fs::metadata(&part_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if success && part_size >= MIN_AUDIO_BYTES {
+            if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
+                eprintln!("[stream] rename: {e}");
+                let _ = tokio::fs::remove_file(&part_path).await;
+            } else {
+                eprintln!("[stream] cached {video_id} ({part_size} bytes)");
+            }
+        } else {
+            if success {
+                eprintln!(
+                    "[stream] download too small for {video_id}: {part_size} bytes (min {MIN_AUDIO_BYTES})"
+                );
+            } else {
+                eprintln!("[stream] download failed {video_id}");
+            }
+            let _ = tokio::fs::remove_file(&part_path).await;
+        }
+
+        state.complete.store(true, Ordering::Release);
+        state.notify.notify_waiters();
+
+        if success {
+            // Evict from in-memory map after a grace period so a brief
+            // re-play stays in RAM, then falls back to on-disk ServeFile.
+            let downloads_evict = downloads.clone();
+            let key = map_key.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                downloads_evict.lock().await.remove(&key);
+            });
+        } else {
+            // Failed: drop the entry immediately so the next play retries
+            // instead of getting an instant 502 for the whole 60s window.
+            downloads.lock().await.remove(&map_key);
+        }
+
+        // Keep the persistent cache under its configured size cap. Only
+        // the shared cache is bounded — the (legacy) ephemeral pool is
+        // wiped wholesale on startup, so it needs no per-track eviction.
+        if success && target_dir == srv.cache_dir {
+            let limit = srv.cache_limit.load(Ordering::Relaxed);
+            enforce_cache_limit(srv.cache_dir.clone(), limit, AUDIO_CACHE_EXTENSIONS).await;
+        }
+    });
+}
+
+/// Read the first 16 bytes of a completed track file and map the
+/// container magic to the right `audio/*` mime. Every track is saved
+/// with a `.webm` extension regardless of what yt-dlp actually
+/// produced, so we can't trust the extension.
+async fn sniff_audio_mime(path: &std::path::Path) -> &'static str {
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = tokio::fs::File::open(path).await {
+        let _ = f.read(&mut buf).await;
+    }
+    if &buf[4..8] == b"ftyp" {
+        "audio/mp4"
+    } else if &buf[..4] == &[0x1A, 0x45, 0xDF, 0xA3] {
+        "audio/webm"
+    } else if &buf[..3] == b"ID3" {
+        "audio/mpeg"
+    } else {
+        "audio/webm"
+    }
+}
+
+/// GET /stream/:video_id — unified serving path supporting Range
+/// requests even during an active download.
+async fn stream_handler(
+    AxumState(srv): AxumState<StreamServer>,
+    Path(video_id): Path<String>,
+    req: Request,
+) -> Response {
+    if !sanitize_video_id(&video_id) {
+        return (StatusCode::BAD_REQUEST, "invalid videoId").into_response();
+    }
+
+    let ephemeral = is_ephemeral(&req);
+    let target_dir = if ephemeral {
+        srv.ephemeral_dir.clone()
+    } else {
+        srv.cache_dir.clone()
+    };
+    let map_key = if ephemeral {
+        format!("e:{video_id}")
+    } else {
+        format!("p:{video_id}")
+    };
+    let final_path = target_dir.join(format!("{video_id}.webm"));
+
+    // If the full file isn't on disk yet, start (or attach to) the
+    // download and block until it completes. Attempting to progressively
+    // stream yt-dlp's stdout broke in two ways:
+    //   - m4a/mp4 audio tracks often have the `moov` atom at the end of
+    //     the file, so Chromium can't decode them until every byte has
+    //     arrived. The first request then fails with
+    //     MEDIA_ERR_SRC_NOT_SUPPORTED.
+    //   - There's no valid HTTP response for a stream whose total length
+    //     is unknown AND whose Range subset has an unknown end
+    //     (`Content-Range: bytes 0-*/*` is grammatically invalid per
+    //     RFC 7233). Serving with `Accept-Ranges: none` works but then
+    //     Chromium disables seeking entirely.
+    //
+    // Full download + `ServeFile` sidesteps both problems: Range
+    // requests, seeking, content-type detection, and large file support
+    // all become the crate's problem. The "first-play" latency is just
+    // the download time (~1-3 s on a healthy connection for a typical
+    // 3-minute track) and the existing next-track prefetcher hides it
+    // from the user on every track except the very first one.
+    let t0 = std::time::Instant::now();
+
+    let range_hdr = req
+        .headers()
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    eprintln!(
+        "[stream] GET /stream/{video_id} range={range_hdr:?} cached={} ephemeral={ephemeral}",
+        final_path.exists()
+    );
+
+    if !final_path.exists() {
+        let state = {
+            let mut map = srv.downloads.lock().await;
+            if let Some(s) = map.get(&map_key) {
+                s.clone()
+            } else {
+                let s = Arc::new(DownloadState {
+                    complete: Arc::new(AtomicBool::new(false)),
+                    notify: Arc::new(Notify::new()),
+                });
+                map.insert(map_key.clone(), s.clone());
+                drop(map);
+                spawn_downloader(
+                    video_id.clone(),
+                    target_dir.clone(),
+                    map_key.clone(),
+                    srv.clone(),
+                    s.clone(),
+                );
+                s
+            }
+        };
+
+        // Bounded wait — 120 s is generous for any single track; if
+        // yt-dlp is wedged past that, we'd rather fail fast than hang
+        // the audio element forever.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        while !state.complete.load(Ordering::Acquire) {
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!("[stream] {video_id}: TIMEOUT after 120s");
+                return (StatusCode::GATEWAY_TIMEOUT, "download timeout")
+                    .into_response();
+            }
+            let notified = state.notify.notified();
+            tokio::pin!(notified);
+            let _ = tokio::time::timeout(Duration::from_secs(5), notified).await;
+        }
+
+        if !final_path.exists() {
+            eprintln!(
+                "[stream] {video_id}: BAD_GATEWAY — complete but no .webm (elapsed {:.2}s)",
+                t0.elapsed().as_secs_f32()
+            );
+            return (StatusCode::BAD_GATEWAY, "download failed").into_response();
+        }
+        eprintln!(
+            "[stream] {video_id}: download finished in {:.2}s",
+            t0.elapsed().as_secs_f32()
+        );
+    }
+
+    // Sniff actual content-type from the file's magic bytes. Every
+    // track is saved with a `.webm` extension, but yt-dlp falls back
+    // to m4a when a video has no webm audio — serving that as
+    // `video/webm` (what tower-http guesses from the extension) makes
+    // Chromium refuse to decode.
+    let sniffed_ct = sniff_audio_mime(&final_path).await;
+    let mut resp = ServeFile::new(&final_path)
+        .oneshot(req)
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}"))
+                .into_response()
+        });
+    if resp.status().is_success() || resp.status() == StatusCode::PARTIAL_CONTENT {
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(sniffed_ct),
+        );
+    }
+    eprintln!(
+        "[stream] {video_id}: responding {} ({:.2}s total) ct={:?} len={:?}",
+        resp.status(),
+        t0.elapsed().as_secs_f32(),
+        resp.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+    );
+    resp
+}
+
+/// Session-only video files kept in the ephemeral pool; older ones are
+/// deleted as new ones finish so watching clips all day cannot fill the disk.
+const VIDEO_CACHE_KEEP: usize = 4;
+
+/// Requested picture height from `?q=`: 720, 1080 or 1440 (default 720).
+fn video_quality(req: &Request) -> u32 {
+    let q = req.uri().query().unwrap_or("");
+    for kv in q.split('&') {
+        let mut it = kv.splitn(2, '=');
+        if it.next() == Some("q") {
+            return match it.next().unwrap_or("") {
+                "1080" => 1080,
+                "1440" => 1440,
+                _ => 720,
+            };
+        }
+    }
+    720
+}
+
+/// yt-dlp format selector for a picture height. H.264 is preferred up to
+/// 1080p (hardware-decoded); above that only VP9/AV1 exist, and VP9 is
+/// tried before AV1, which can be software-decoded and heavy.
+fn video_format(height: u32) -> String {
+    let h = height;
+    if h > 1080 {
+        format!(
+            "bestvideo[height<={h}][vcodec^=vp9][protocol^=http]/bestvideo[height<={h}][protocol^=http]/bestvideo[height<={h}]/best[height<={h}]"
+        )
+    } else {
+        format!(
+            "bestvideo[height<={h}][vcodec^=avc1][protocol^=http]/bestvideo[height<={h}][protocol^=http]/bestvideo[height<={h}]/best[height<={h}]"
+        )
+    }
+}
+
+/// Sniff the container of a cached video file (MP4 vs WebM).
+async fn sniff_video_mime(path: &std::path::Path) -> &'static str {
+    let mut buf = [0u8; 16];
+    if let Ok(mut f) = tokio::fs::File::open(path).await {
+        let _ = f.read(&mut buf).await;
+    }
+    if &buf[4..8] == b"ftyp" {
+        "video/mp4"
+    } else {
+        "video/webm"
+    }
+}
+
+/// Delete all but the `keep` most recently written `*.video.mp4` files.
+async fn prune_video_cache(dir: &std::path::Path, keep: usize) {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        let is_video = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".video.mp4"))
+            .unwrap_or(false);
+        if !is_video {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        files.push((modified, path));
+    }
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    for (_, path) in files.into_iter().skip(keep) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+/// Download the picture (video-only, up to 720p) for the immersive
+/// fullscreen "Video" mode. Same mechanics as `spawn_downloader`, but the
+/// result always lands in the session-only pool as `<id>.video.mp4`, never
+/// in the persistent track cache.
+fn spawn_video_downloader(
+    video_id: String,
+    target_dir: PathBuf,
+    map_key: String,
+    srv: StreamServer,
+    state: Arc<DownloadState>,
+    height: u32,
+) {
+    let downloads = srv.downloads.clone();
+    tokio::spawn(async move {
+        let url = format!("https://www.youtube.com/watch?v={video_id}");
+        let part_path = target_dir.join(format!("{video_id}.{height}p.video.part"));
+        let final_path = target_dir.join(format!("{video_id}.{height}p.video.mp4"));
+        let _ = tokio::fs::create_dir_all(&target_dir).await;
+        let _ = tokio::fs::remove_file(&part_path).await;
+
+        let program = ytdlp::program(&srv.ytdlp_bin);
+
+        // H.264 first (hardware-decoded everywhere), then any other
+        // progressive video-only stream, then a combined format as a last
+        // resort. The element is muted, so audio in the file is harmless.
+        let video_format = video_format(height);
+        let mut attempt =
+            download_attempt(&program, &url, &part_path, &video_format, None, &state).await;
+
+        if !attempt.ok && attempt.age_gated {
+            if let Some(cookies) = write_temp_cookies(&srv.app).await {
+                attempt = download_attempt(
+                    &program,
+                    &url,
+                    &part_path,
+                    &video_format,
+                    Some(cookies.path()),
+                    &state,
+                )
+                .await;
+            }
+        }
+
+        let success = attempt.ok;
+        const MIN_VIDEO_BYTES: u64 = 256 * 1024;
+        let part_size = tokio::fs::metadata(&part_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if success && part_size >= MIN_VIDEO_BYTES {
+            if let Err(e) = tokio::fs::rename(&part_path, &final_path).await {
+                eprintln!("[video] rename: {e}");
+                let _ = tokio::fs::remove_file(&part_path).await;
+            } else {
+                eprintln!("[video] cached {video_id} ({part_size} bytes)");
+                prune_video_cache(&target_dir, VIDEO_CACHE_KEEP).await;
+            }
+        } else {
+            eprintln!("[video] download failed or too small for {video_id} ({part_size} bytes)");
+            let _ = tokio::fs::remove_file(&part_path).await;
+        }
+
+        state.complete.store(true, Ordering::Release);
+        state.notify.notify_waiters();
+
+        if success {
+            let downloads_evict = downloads.clone();
+            let key = map_key.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                downloads_evict.lock().await.remove(&key);
+            });
+        } else {
+            downloads.lock().await.remove(&map_key);
+        }
+    });
+}
+
+/// GET /video/:video_id — the muted picture for the immersive fullscreen
+/// "Video" mode. Downloaded in full on first request (like /stream), then
+/// served from disk with Range support.
+async fn video_handler(
+    AxumState(srv): AxumState<StreamServer>,
+    Path(video_id): Path<String>,
+    req: Request,
+) -> Response {
+    if !sanitize_video_id(&video_id) {
+        return (StatusCode::BAD_REQUEST, "invalid videoId").into_response();
+    }
+
+    let height = video_quality(&req);
+    let target_dir = srv.ephemeral_dir.clone();
+    let map_key = format!("v:{video_id}:{height}");
+    let final_path = target_dir.join(format!("{video_id}.{height}p.video.mp4"));
+
+    if !final_path.exists() {
+        let state = {
+            let mut map = srv.downloads.lock().await;
+            if let Some(s) = map.get(&map_key) {
+                s.clone()
+            } else {
+                let s = Arc::new(DownloadState {
+                    complete: Arc::new(AtomicBool::new(false)),
+                    notify: Arc::new(Notify::new()),
+                });
+                map.insert(map_key.clone(), s.clone());
+                drop(map);
+                spawn_video_downloader(
+                    video_id.clone(),
+                    target_dir.clone(),
+                    map_key.clone(),
+                    srv.clone(),
+                    s.clone(),
+                    height,
+                );
+                s
+            }
+        };
+
+        // Video files are an order of magnitude bigger than audio: allow
+        // more time before giving up.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        while !state.complete.load(Ordering::Acquire) {
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!("[video] {video_id}: TIMEOUT after 300s");
+                return (StatusCode::GATEWAY_TIMEOUT, "download timeout").into_response();
+            }
+            let notified = state.notify.notified();
+            tokio::pin!(notified);
+            let _ = tokio::time::timeout(Duration::from_secs(5), notified).await;
+        }
+
+        if !final_path.exists() {
+            return (StatusCode::BAD_GATEWAY, "download failed").into_response();
+        }
+    }
+
+    let sniffed_ct = sniff_video_mime(&final_path).await;
+    let mut resp = ServeFile::new(&final_path)
+        .oneshot(req)
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}")).into_response()
+        });
+    if resp.status().is_success() || resp.status() == StatusCode::PARTIAL_CONTENT {
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(sniffed_ct),
+        );
+    }
+    resp
+}
+
+/// GET /cover/:filename — serve a cached cover image. Files are placed
+/// here by the `cache_cover` Tauri command. The filename is a hex hash +
+/// extension produced by `url_to_filename`, which is the only way bytes
+/// land in this directory — so accepting `[a-zA-Z0-9.]+` is enough to
+/// rule out path traversal.
+async fn cover_serve_handler(
+    AxumState(srv): AxumState<StreamServer>,
+    Path(filename): Path<String>,
+    req: Request,
+) -> Response {
+    if filename.is_empty()
+        || filename.len() > 64
+        || !filename
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.')
+        || filename.contains("..")
+    {
+        return (StatusCode::BAD_REQUEST, "invalid filename").into_response();
+    }
+    let path = srv.cover_dir.join(&filename);
+    if !path.exists() {
+        return (StatusCode::NOT_FOUND, "not cached").into_response();
+    }
+    let mut resp = ServeFile::new(&path)
+        .oneshot(req)
+        .await
+        .map(|r| r.into_response())
+        .unwrap_or_else(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("serve: {e}"))
+                .into_response()
+        });
+    if resp.status().is_success() {
+        // Filename is content-addressed (hash of the source URL), so
+        // the bytes never change — let the webview cache aggressively.
+        resp.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    }
+    resp
+}
+
+/// GET /prefetch/:video_id — fire-and-forget cache warmer. Honours the
+/// same `?ephemeral=1` flag as /stream so non-Premium prefetches (if
+/// the frontend ever lets one through) land in the session-only pool
+/// rather than the persistent cache.
+async fn prefetch_handler(
+    AxumState(srv): AxumState<StreamServer>,
+    Path(video_id): Path<String>,
+    req: Request,
+) -> StatusCode {
+    if !sanitize_video_id(&video_id) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let ephemeral = is_ephemeral(&req);
+    let target_dir = if ephemeral {
+        srv.ephemeral_dir.clone()
+    } else {
+        srv.cache_dir.clone()
+    };
+    let map_key = if ephemeral {
+        format!("e:{video_id}")
+    } else {
+        format!("p:{video_id}")
+    };
+    let final_path = target_dir.join(format!("{video_id}.webm"));
+    if final_path.exists() {
+        return StatusCode::OK;
+    }
+    let state = {
+        // Single lock hold for check-then-insert so a concurrent /stream
+        // (whose check+insert is already atomic) or a second /prefetch can't
+        // slip in between and spawn a second downloader writing the same
+        // .part file, corrupting the cached track.
+        let mut map = srv.downloads.lock().await;
+        if map.contains_key(&map_key) {
+            return StatusCode::ACCEPTED;
+        }
+        let state = Arc::new(DownloadState {
+            complete: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        });
+        map.insert(map_key.clone(), state.clone());
+        state
+    };
+    spawn_downloader(video_id, target_dir, map_key, srv.clone(), state);
+    StatusCode::ACCEPTED
+}
+
+/// Generate an unguessable per-launch token used as a URL path prefix on
+/// the local stream server. Uses OS-seeded RandomState (SipHash keys)
+/// instead of pulling in an RNG crate — 128 bits is ample for a localhost
+/// secret that only needs to resist online guessing by a web page.
+fn generate_stream_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut out = String::with_capacity(32);
+    for _ in 0..2 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u64(0x9E37_79B9_7F4A_7C15);
+        out.push_str(&format!("{:016x}", h.finish()));
+    }
+    out
+}
+
+async fn start_stream_server(
+    app: tauri::AppHandle,
+    port_state: Arc<Mutex<Option<u16>>>,
+    token_state: Arc<Mutex<Option<String>>>,
+    cache_dir: PathBuf,
+    ephemeral_dir: PathBuf,
+    cover_dir: PathBuf,
+    ytdlp_bin: PathBuf,
+    cache_limit: Arc<AtomicU64>,
+) {
+    if let Err(e) = tokio::fs::create_dir_all(&cache_dir).await {
+        eprintln!("[stream-server] mkdir {cache_dir:?}: {e}");
+    }
+    if let Err(e) = tokio::fs::create_dir_all(&ephemeral_dir).await {
+        eprintln!("[stream-server] mkdir {ephemeral_dir:?}: {e}");
+    }
+    if let Err(e) = tokio::fs::create_dir_all(&cover_dir).await {
+        eprintln!("[stream-server] mkdir {cover_dir:?}: {e}");
+    }
+
+    // Wipe the legacy ephemeral pool. All users now cache persistently
+    // (see the `stream.ts` URLs), so nothing new is routed here; this
+    // just sweeps any `.webm` a pre-caching-for-everyone build left
+    // behind so it doesn't linger untracked.
+    if let Ok(mut rd) = tokio::fs::read_dir(&ephemeral_dir).await {
+        let mut wiped: u64 = 0;
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if let Ok(meta) = entry.metadata().await {
+                if meta.is_file() {
+                    wiped += meta.len();
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
+            }
+        }
+        if wiped > 0 {
+            eprintln!("[stream-server] wiped {wiped} bytes from ephemeral dir");
+        }
+    }
+
+    // Bring the persistent cache under its cap immediately at startup —
+    // e.g. after the user lowered the limit while the app was closed, or
+    // after a crash left the cache over budget.
+    enforce_cache_limit(
+        cache_dir.clone(),
+        cache_limit.load(Ordering::Relaxed),
+        AUDIO_CACHE_EXTENSIONS,
+    )
+    .await;
+
+    // Same idea for the cover-image cache — bring it under its (fixed)
+    // cap immediately at startup too, e.g. after a crash left it over
+    // budget or the app was updated with a lower default.
+    enforce_cache_limit(
+        cover_dir.clone(),
+        DEFAULT_COVER_CACHE_LIMIT_BYTES,
+        COVER_CACHE_EXTENSIONS,
+    )
+    .await;
+
+    let server = StreamServer {
+        app,
+        cache_dir,
+        ephemeral_dir,
+        cover_dir,
+        downloads: Arc::new(Mutex::new(HashMap::new())),
+        ytdlp_bin,
+        cache_limit,
+    };
+
+    // Per-launch token as an unguessable path prefix. Baked into the base
+    // URL (get_stream_base_url) and cover URLs (cache_cover), so it's
+    // transparent to the webview but blocks blind access from a web page
+    // that only knows the random port.
+    let token = generate_stream_token();
+    *token_state.lock().await = Some(token.clone());
+
+    let routes = Router::new()
+        .route("/stream/:video_id", get(stream_handler))
+        .route("/video/:video_id", get(video_handler))
+        .route("/prefetch/:video_id", get(prefetch_handler))
+        .route("/cover/:filename", get(cover_serve_handler))
+        .with_state(server);
+    let app = Router::new()
+        .nest(&format!("/{token}"), routes)
+        .layer(CorsLayer::permissive());
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[stream-server] bind failed: {e}");
+            return;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port(),
+        Err(e) => {
+            eprintln!("[stream-server] local_addr failed: {e}");
+            return;
+        }
+    };
+    *port_state.lock().await = Some(port);
+    eprintln!("[stream-server] listening on 127.0.0.1:{port}");
+
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("[stream-server] serve error: {e}");
+    }
+}
+
+/// Show + focus the main window (from tray click or single-instance
+/// re-launch).
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// App icon for runtime surfaces (tray, taskbar). Debug builds get an
+/// orange variant of the logo so a dev instance running next to an
+/// installed release is distinguishable at a glance; release builds use
+/// the bundled (red) icon.
+fn runtime_icon(app: &tauri::AppHandle) -> tauri::image::Image<'static> {
+    #[cfg(debug_assertions)]
+    {
+        if let Ok(icon) =
+            tauri::image::Image::from_bytes(include_bytes!("../icons/icon-dev.png"))
+        {
+            return icon;
+        }
+    }
+    app.default_window_icon()
+        .cloned()
+        .expect("bundled window icon missing")
+        .to_owned()
+}
+
+fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show_item = MenuItem::with_id(app, "show", "Show YTubic", true, None::<&str>)?;
+    let play_item = MenuItem::with_id(app, "play_pause", "Play / Pause", true, Some("Space"))?;
+    let prev_item = MenuItem::with_id(app, "prev", "Previous", true, None::<&str>)?;
+    let next_item = MenuItem::with_id(app, "next", "Next", true, None::<&str>)?;
+    let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+
+    let menu = Menu::with_items(
+        app,
+        &[&show_item, &sep, &play_item, &prev_item, &next_item, &sep, &quit_item],
+    )?;
+
+    let _tray = TrayIconBuilder::with_id("main-tray")
+        .icon(runtime_icon(app))
+        .tooltip(if cfg!(debug_assertions) {
+            "YTubic (dev)"
+        } else {
+            "YTubic"
+        })
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "play_pause" => {
+                let _ = app.emit("tray-action", "play_pause");
+            }
+            "prev" => {
+                let _ = app.emit("tray-action", "prev");
+            }
+            "next" => {
+                let _ = app.emit("tray-action", "next");
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // Left-click the icon = show the window.
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    // Register + pin the app's Windows identity (AppUserModelID) so the SMTC
+    // media tile (and notifications, taskbar) resolve to "YTubic" + icon rather
+    // than "Unknown app". Must run before any window is created. No-op off
+    // Windows.
+    appid::init();
+
+    let state = StreamServerState::default();
+    let port_handle = state.port.clone();
+    let token_handle = state.token.clone();
+    let cache_limit_handle = state.cache_limit.clone();
+
+    tauri::Builder::default()
+        // The `deep-link` feature forwards the second instance's argv
+        // (a `ytubic://` URL) to the deep-link plugin, so the running app
+        // receives it as a `deep-link://new-url` event.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(
+            // Default StateFlags includes DECORATIONS, which would
+            // override our `decorations: false` from tauri.conf.json
+            // every time the saved state is restored. Exclude it.
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        & !tauri_plugin_window_state::StateFlags::DECORATIONS,
+                )
+                .build(),
+        )
+        .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .manage(state)
+        .manage(CloseBehavior::default())
+        .manage(JarWriteLock::default())
+        .manage(discord::DiscordState::default())
+        .invoke_handler(tauri::generate_handler![
+            ensure_ytdlp,
+            check_ytdlp_update,
+            resolve_stream_ytdlp,
+            get_stream_base_url,
+            start_login,
+            get_cookie_header,
+            get_auth_context,
+            merge_response_cookies,
+            is_logged_in,
+            probe_session,
+            clear_cookies,
+            list_accounts,
+            switch_account,
+            remove_account,
+            update_account_meta,
+            set_account_channel,
+            get_active_account_id,
+            list_cache,
+            delete_cache_entries,
+            get_cache_limit,
+            set_cache_limit,
+            cache_cover,
+            download_cover,
+            cover_cache_stats,
+            clear_cover_cache,
+            quit_app,
+            set_close_behavior,
+            autostart_set,
+            autostart_is_enabled,
+            notify_track,
+            get_cache_dir,
+            set_cache_dir,
+            pick_cache_folder,
+            focus_main_window,
+            open_player_window,
+            close_player_window,
+            media::media_update,
+            media::media_clear,
+            discord::discord_set_config,
+            discord::discord_update,
+            discord::discord_clear,
+            update_source::update_source,
+        ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                match window.label() {
+                    // Main window: hide to tray or quit, per the user's
+                    // Settings choice (default tray). Quit goes through
+                    // an explicit exit — just letting the close proceed
+                    // could leave a floating-player window keeping the
+                    // process alive headless.
+                    "main" => {
+                        let quit = window
+                            .state::<CloseBehavior>()
+                            .quit_on_close
+                            .load(Ordering::Relaxed);
+                        if quit {
+                            window.app_handle().exit(0);
+                        } else {
+                            let _ = window.hide();
+                            api.prevent_close();
+                        }
+                    }
+                    // The floating player window actually closes — we
+                    // tell the main window so it can revert the layout
+                    // mode back to "right".
+                    "player" => {
+                        let _ = window.app_handle().emit("player-window-closed", ());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .setup(move |app| {
+            let port = port_handle.clone();
+            let token = token_handle.clone();
+            // User-chosen cache root (Settings → Storage) or the OS
+            // default. Captured once and exposed as managed state so
+            // every cache-path computation matches the directories the
+            // stream server is about to bind — a preference change made
+            // later only applies after relaunch.
+            let cache_root = stored_cache_root(app.handle())
+                .unwrap_or_else(|| default_cache_root(app.handle()));
+            app.manage(ActiveCacheRoot(cache_root.clone()));
+            let cache_dir = cache_root.join("stream");
+            let ephemeral_dir = cache_root.join("stream-ephemeral");
+            let cover_dir = cache_root.join("covers");
+            let handle = app.handle().clone();
+            eprintln!("[stream-server] cache dir: {cache_dir:?}");
+            eprintln!("[stream-server] ephemeral dir: {ephemeral_dir:?}");
+            eprintln!("[stream-server] cover dir: {cover_dir:?}");
+            let ytdlp_bin = ytdlp::managed_path(&handle);
+            let cache_limit = cache_limit_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                migrate_plaintext_cookies(&handle).await;
+                migrate_to_accounts_layout(&handle).await;
+                // Heal any duplicate account rows left by the old
+                // email-based dedup before the UI reads the list.
+                dedup_accounts_by_identity(&handle).await;
+                cleanup_login_artifacts(&handle).await;
+                // Seed the shared limit from disk (or the default) before
+                // the server starts enforcing it.
+                cache_limit.store(read_cache_limit(&handle).await, Ordering::Relaxed);
+                start_stream_server(
+                    handle,
+                    port,
+                    token,
+                    cache_dir,
+                    ephemeral_dir,
+                    cover_dir,
+                    ytdlp_bin,
+                    cache_limit,
+                )
+                .await;
+            });
+            // OS media controls (Windows SMTC tile / Linux MPRIS session,
+            // plus the hardware media keys). setup() runs on the main
+            // thread, which souvlaki requires and where the main window's
+            // HWND is available.
+            media::init(app.handle());
+            // The NSIS installer registers `ytubic://` for release builds;
+            // dev runs and Linux need the runtime registration.
+            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    eprintln!("[deep-link] register failed: {e}");
+                }
+            }
+            if let Err(e) = build_tray(app.handle()) {
+                eprintln!("[tray] build failed: {e}");
+            }
+
+            // WebKitGTK ships with smooth (kinetic) scrolling OFF by default,
+            // so wheel scrolling jumps in coarse line-height steps and feels
+            // clunky. Flip it on directly on the underlying WebView — wry
+            // doesn't expose it. No-op on other platforms.
+            #[cfg(target_os = "linux")]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.with_webview(|webview| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    let wv = webview.inner();
+                    if let Some(settings) = WebViewExt::settings(&wv) {
+                        settings.set_enable_smooth_scrolling(true);
+                    }
+                });
+            }
+            // Ported from upstream 8cdb647: grant mic to own pages without
+            // WebView2 dialog (Playback tab needs it for output devices).
+            #[cfg(windows)]
+            if let Some(w) = app.get_webview_window("main") {
+                webview_permissions::install(&w);
+            }
+            // Debug builds swap the taskbar/window icon to the orange
+            // dev variant (see runtime_icon) so a dev instance is
+            // instantly distinguishable from an installed release.
+            #[cfg(debug_assertions)]
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.set_icon(runtime_icon(app.handle()));
+            }
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_stream_token;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    #[test]
+    fn stream_token_is_nonempty_hex_and_varies() {
+        let a = generate_stream_token();
+        let b = generate_stream_token();
+        assert_eq!(a.len(), 32, "token should be 128 bits of hex");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "two tokens in a row must differ");
+    }
+
+    // Guards the security fix (review high #1): the stream server nests all
+    // routes under an unguessable per-launch token prefix, so a request that
+    // doesn't carry the exact token can't reach a handler.
+    #[test]
+    fn nested_token_prefix_gates_routes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let token = "deadbeefdeadbeefdeadbeefdeadbeef";
+            let inner = Router::new().route("/ping", get(|| async { "pong" }));
+            let app: Router = Router::new().nest(&format!("/{token}"), inner);
+
+            let status = |uri: &'static str, app: Router| async move {
+                app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            };
+
+            assert_eq!(
+                status(
+                    "/deadbeefdeadbeefdeadbeefdeadbeef/ping",
+                    app.clone()
+                )
+                .await,
+                StatusCode::OK,
+                "correct token reaches the handler"
+            );
+            assert_eq!(
+                status("/wrongtoken/ping", app.clone()).await,
+                StatusCode::NOT_FOUND,
+                "a wrong token must not reach the handler"
+            );
+            assert_eq!(
+                status("/ping", app).await,
+                StatusCode::NOT_FOUND,
+                "no token must not reach the handler"
+            );
+        });
+    }
+
+    // Legacy `cookies.enc` files written by the old plaintext fallback have
+    // no header; decrypt must pass them straight through so existing
+    // sign-ins survive the upgrade to the encrypted format.
+    #[cfg(not(windows))]
+    #[test]
+    fn legacy_headerless_blob_decrypts_verbatim() {
+        let legacy = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\txyz\n";
+        let out = super::secure_store::decrypt(legacy).expect("legacy passthrough");
+        assert_eq!(out, legacy, "headerless blob must survive untouched");
+    }
+
+    // A short blob that can't hold a header is treated as legacy too.
+    #[cfg(not(windows))]
+    #[test]
+    fn short_blob_is_treated_as_legacy() {
+        let tiny = b"hi";
+        let out = super::secure_store::decrypt(tiny).expect("short passthrough");
+        assert_eq!(out, tiny);
+    }
+
+    // Live end-to-end roundtrip against the real Secret Service. Ignored by
+    // default because CI runners have no unlocked keyring; run locally with
+    // `cargo test -- --ignored secure_store_roundtrip`.
+    #[cfg(not(windows))]
+    #[test]
+    #[ignore]
+    fn secure_store_roundtrip_uses_keyring() {
+        let plain = b"# Netscape HTTP Cookie File\n.google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tsecret\n";
+        let enc = super::secure_store::encrypt(plain).expect("encrypt");
+        assert_ne!(&enc[..], &plain[..], "ciphertext must not equal plaintext");
+        assert_eq!(&enc[..4], b"YTSS", "blob must carry the header magic");
+        let dec = super::secure_store::decrypt(&enc).expect("decrypt");
+        assert_eq!(dec, plain, "roundtrip must recover the exact bytes");
+    }
+
+    use super::merge_set_cookies_into_jar;
+    use super::header_has_auth_cookie;
+
+    const NOW: i64 = 1_700_000_000;
+    const HOST: &str = "music.youtube.com";
+
+    fn jar() -> String {
+        "# Netscape HTTP Cookie File\n\
+         .youtube.com\tTRUE\t/\tTRUE\t1800000000\tSAPISID\told-sapisid\n\
+         .youtube.com\tTRUE\t/\tTRUE\t1800000000\tSIDCC\told-sidcc\n"
+            .to_string()
+    }
+
+    #[test]
+    fn merge_replaces_rotated_value() {
+        let lines = vec![
+            "SIDCC=new-sidcc; Domain=.youtube.com; Path=/; Secure; Max-Age=31536000".to_string(),
+        ];
+        let m = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(m.value_changed && m.needs_write);
+        assert!(m.jar.contains("SIDCC\tnew-sidcc"));
+        assert!(!m.jar.contains("old-sidcc"));
+        assert!(
+            m.jar.contains("SAPISID\told-sapisid"),
+            "untouched cookie survives"
+        );
+    }
+
+    #[test]
+    fn merge_inserts_new_cookie_with_domain() {
+        let lines =
+            vec!["LOGIN_INFO=abc; Domain=.youtube.com; Path=/; Secure; HttpOnly; Max-Age=63072000"
+                .to_string()];
+        let m = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(m.value_changed);
+        assert!(m.jar.contains(".youtube.com\tTRUE\t/\tTRUE\t1763072000\tLOGIN_INFO\tabc"));
+    }
+
+    #[test]
+    fn merge_inserts_host_only_cookie_under_response_host() {
+        let lines = vec!["PZS=1; Path=/; Secure; Max-Age=600".to_string()];
+        let m = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(m.value_changed);
+        assert!(m.jar.contains(".music.youtube.com\tTRUE\t/\tTRUE"));
+    }
+
+    #[test]
+    fn merge_removes_expired_cookie() {
+        let lines = vec!["SIDCC=gone; Domain=.youtube.com; Path=/; Max-Age=0".to_string()];
+        let m = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(m.value_changed);
+        assert!(!m.jar.contains("SIDCC"));
+    }
+
+    // A response must never be able to sign the user out. Google sends a
+    // deletion burst for the identity cookies on a real sign-out, and
+    // `captureSetCookies` runs before the `res.ok` bail, so a 4xx could
+    // carry one too.
+    #[test]
+    fn merge_refuses_to_delete_identity_cookies() {
+        let lines = vec![
+            "SAPISID=EXPIRED; Domain=.youtube.com; Path=/; Max-Age=0".to_string(),
+            "SIDCC=gone; Domain=.youtube.com; Path=/; Max-Age=0".to_string(),
+        ];
+        let m = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(
+            m.jar.contains("SAPISID\told-sapisid"),
+            "identity cookie must survive a server expiry"
+        );
+        assert!(!m.jar.contains("SIDCC"), "rotation cookies stay deletable");
+        assert_eq!(m.blocked_deletions, vec!["youtube.com SAPISID".to_string()]);
+    }
+
+    // RFC 6265 §5.3.5. Without the host check a music.youtube.com
+    // response could plant a cookie on .google.com that we would then
+    // replay to Google as if Google had issued it.
+    #[test]
+    fn merge_rejects_a_domain_the_response_host_is_not_under() {
+        let lines =
+            vec!["EVIL=1; Domain=.google.com; Path=/; Secure; Max-Age=1000".to_string()];
+        let m = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(!m.value_changed && !m.needs_write);
+        assert_eq!(m.jar, jar(), "jar must be untouched");
+    }
+
+    #[test]
+    fn merge_ignores_foreign_domains() {
+        let lines = vec![
+            "tracker=1; Domain=.example.com; Path=/; Max-Age=1000".to_string(),
+            "__cf_bm=x; Domain=.genius.com; Path=/; Max-Age=1000".to_string(),
+        ];
+        let m = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        assert!(!m.value_changed && !m.needs_write);
+        assert_eq!(m.jar, jar(), "jar must be untouched");
+    }
+
+    // `is_logged_in` used to substring-match, and `__Secure-1PSID` is a
+    // prefix of both `__Secure-1PSIDTS` and `__Secure-1PSIDCC`, so a jar
+    // that had lost the real SID still reported a live session.
+    #[test]
+    fn auth_check_ignores_prefix_lookalike_cookies() {
+        assert!(!header_has_auth_cookie(
+            "__Secure-1PSIDTS=a; __Secure-1PSIDCC=b; SIDCC=c"
+        ));
+    }
+
+    #[test]
+    fn auth_check_needs_both_an_apisid_and_a_sid() {
+        assert!(!header_has_auth_cookie("SAPISID=a; SIDCC=b"));
+        assert!(!header_has_auth_cookie("__Secure-1PSID=a; YSC=b"));
+        assert!(header_has_auth_cookie("SAPISID=a; __Secure-1PSID=b"));
+        assert!(header_has_auth_cookie("__Secure-3PAPISID=a; SID=b"));
+    }
+
+    #[test]
+    fn auth_check_tolerates_spacing_and_empty_input() {
+        assert!(header_has_auth_cookie("  SAPISID=a ;   SID=b  "));
+        assert!(!header_has_auth_cookie(""));
+    }
+
+    #[test]
+    fn merge_expiry_only_refresh_persists_without_cache_reset() {
+        let lines = vec![
+            "SIDCC=old-sidcc; Domain=.youtube.com; Path=/; Secure; Max-Age=31536000".to_string(),
+        ];
+        let m = merge_set_cookies_into_jar(&jar(), &lines, HOST, NOW);
+        let (out, changed, dirty) = (m.jar, m.value_changed, m.needs_write);
+        assert!(!changed, "same value must not invalidate the header cache");
+        assert!(dirty, "but the fresher expiry should be written");
+        assert!(out.contains(&format!("{}", NOW + 31_536_000)));
+    }
+}

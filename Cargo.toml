@@ -1,0 +1,131 @@
+[package]
+name = "ytubic"
+version = "0.11.3"
+description = "YTubic — fast, responsive YouTube Music desktop client"
+authors = ["George Shyshov"]
+license = "GPL-3.0-only"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "ytubic_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-deep-link = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# default-features minus `cookies`: the plugin's persistent cookie store
+# (app-cache/.cookies) silently captured Google's rotated session cookies
+# while our requests kept replaying the static jar snapshot — Google reads
+# that divergence as stolen-cookie replay and revokes the session within
+# hours. We echo rotations into the jar ourselves (merge_response_cookies),
+# so the shadow store must not exist: it also attached partial cookie sets
+# to requests that carried no explicit Cookie header, and it kept session
+# security cookies in plaintext next to our DPAPI-encrypted jar.
+tauri-plugin-http = { version = "2", default-features = false, features = [
+    "unsafe-headers",
+    "rustls-tls",
+    "http2",
+    "charset",
+    "macos-system-configuration",
+] }
+tauri-plugin-store = "2"
+tauri-plugin-shell = "2"
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+urlencoding = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "process", "sync", "net"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+tower = "0.5"
+cookie = "0.18"
+time = "0.3"
+base64 = "0.22"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-process = "2.3.1"
+tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+# Native media controls: SMTC on Windows, MPRIS on Linux, and Now Playing on
+# macOS. We create the Windows SMTC from the host process so the tile resolves
+# to YTubic's identity instead of the msedgewebview2.exe child. See media.rs.
+souvlaki = "0.7"
+# Discord Rich Presence: talks to the local Discord client over its IPC
+# socket / named pipe (no native deps beyond that). Off by default; opt-in
+# from Settings. See src/discord.rs. Set YTUBIC_DISCORD_APP_ID at build time
+# (or edit APP_ID) to the Application ID of a Discord app named "YTubic".
+discord-rich-presence = "0.2"
+# MD5 for Last.fm request signing (api_sig = md5 of sorted params + secret).
+# Tiny, single-purpose crate. See src/lastfm.rs.
+md5 = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    # SetCurrentProcessExplicitAppUserModelID — pins our AppUserModelID onto the
+    # process so the SMTC media tile resolves (via the installer's matching Start
+    # Menu shortcut) to "YTubic" instead of "Unknown app". See src/appid.rs.
+    "Win32_UI_Shell",
+    # PowerRegisterSuspendResumeNotification: wake the session-refresh loop on
+    # resume from sleep/standby instead of waiting out a tokio timer that may
+    # not have advanced while the machine was suspended. See src/power.rs.
+    "Win32_System_Power",
+    # DEVICE_NOTIFY_CALLBACK + the PBT_APM* event codes the callback receives.
+    "Win32_UI_WindowsAndMessaging",
+    # GetNetworkConnectivityHint: don't burn a refresh attempt on a NIC that
+    # hasn't reassociated yet after a resume. See src/power.rs.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }
+# The taskbar thumbnail toolbar (shuffle / prev / play-pause / next / repeat /
+# like under the taskbar preview) is COM: ITaskbarList3 plus a window subclass
+# for the button clicks. windows-sys has no safe COM wrappers, and the
+# `windows` crate is already in the tree via tauri/wry, so we only add features
+# to a crate that is compiled anyway. See src/thumbbar.rs.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+] }
+# The toolbar takes HICONs, so its glyphs are rasterized at runtime from the
+# same lucide paths the player bar renders — that way the taskbar row looks
+# like a small copy of the in-app player instead of a hand-drawn approximation.
+# default-features off drops text/font handling (fontdb, system-fonts, raster
+# image formats); these icons are pure paths. See src/thumbbar.rs.
+resvg = { version = "0.48.1", default-features = false }
+# PermissionRequested handler on the main webview (src/webview_permissions.rs).
+# Same version tauri/wry already compile.
+webview2-com = "0.38"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Cookie jars remain files in app data, but their random AES key lives in the
+# native credential store: Secret Service on Linux and Keychain on macOS.
+aes-gcm = "0.10"
+keyring = "4.1.5"
+rand = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Reach the underlying WebKitGTK WebView for Linux-only settings that wry
+# does not expose. Keep this pinned to the version already used by wry so
+# `PlatformWebview::inner()` returns the same type.
+webkit2gtk = "=2.0.2"
+
+[dev-dependencies]
+# ServiceExt::oneshot for the stream-server routing test.
+tower = { version = "0.5", features = ["util"] }
