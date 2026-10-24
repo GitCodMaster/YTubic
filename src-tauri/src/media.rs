@@ -38,14 +38,13 @@
 use std::cell::RefCell;
 use std::time::Duration;
 
+use serde::Deserialize;
 use souvlaki::{MediaControls, MediaMetadata, MediaPlayback, MediaPosition};
 #[cfg(target_os = "windows")]
 use souvlaki::{MediaControlEvent, PlatformConfig};
-#[cfg(target_os = "windows")]
-use tauri::Manager;
 use tauri::AppHandle;
 #[cfg(target_os = "windows")]
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 thread_local! {
     static CONTROLS: RefCell<Option<MediaControls>> = const { RefCell::new(None) };
@@ -120,16 +119,40 @@ pub fn init(app: &AppHandle) {
     }
 }
 
-/// Push the current track's metadata + playback state. Main-thread only.
-fn apply(
+/// Everything the frontend pushes about the current track. Passed as one
+/// object so the command signature doesn't grow a tail of positional flags.
+#[derive(Deserialize)]
+pub struct NowPlaying {
     title: String,
     artist: String,
     album: String,
-    cover: String,
+    thumbnail: String,
     duration: f64,
-    playing: bool,
     elapsed: f64,
-) {
+    paused: bool,
+    /// The three toggle states are for the Windows thumbnail toolbar only;
+    /// SMTC has no concept of them.
+    shuffle: bool,
+    /// "off" | "all" | "one".
+    repeat: String,
+    liked: bool,
+}
+
+/// Push the current track's metadata + playback state. Main-thread only.
+fn apply(app: &AppHandle, now: NowPlaying) {
+    let NowPlaying {
+        title,
+        artist,
+        album,
+        thumbnail: cover,
+        duration,
+        elapsed,
+        paused,
+        shuffle,
+        repeat,
+        liked,
+    } = now;
+    let playing = !paused;
     CONTROLS.with(|cell| {
         if let Some(controls) = cell.borrow_mut().as_mut() {
             // Only re-push metadata (incl. the cover, the expensive part) when
@@ -166,10 +189,35 @@ fn apply(
             });
         }
     });
+    // The window title is what Windows prints above the taskbar
+    // thumbnail preview (and in Alt+Tab), so it carries the track
+    // like Apple Music's does instead of repeating the app name.
+    set_window_title(
+        app,
+        &if artist.is_empty() {
+            title.clone()
+        } else {
+            format!("{title} - {artist}")
+        },
+    );
+    // Keep the taskbar thumbnail toolbar in sync. Cheap: it no-ops unless one
+    // of the states actually changed.
+    #[cfg(windows)]
+    crate::thumbbar::set_state(
+        playing,
+        shuffle,
+        crate::thumbbar::Repeat::from_str(&repeat),
+        liked,
+    );
+    #[cfg(not(windows))]
+    let _ = (shuffle, repeat, liked);
 }
 
-fn clear() {
+fn clear(app: &AppHandle) {
     LAST_META.with(|m| *m.borrow_mut() = None);
+    set_window_title(app, "YTubic");
+    #[cfg(windows)]
+    crate::thumbbar::set_state(false, false, crate::thumbbar::Repeat::Off, false);
     CONTROLS.with(|cell| {
         if let Some(controls) = cell.borrow_mut().as_mut() {
             let _ = controls.set_playback(MediaPlayback::Stopped);
@@ -177,25 +225,36 @@ fn clear() {
     });
 }
 
+/// The main window only: the floating player keeps its own title.
+fn set_window_title(app: &AppHandle, title: &str) {
+    // Windows only: the title feeds the taskbar thumbnail. Elsewhere it would
+    // rename the taskbar entry / task switcher label away from "YTubic".
+    #[cfg(windows)]
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_title(title);
+    }
+    #[cfg(not(windows))]
+    let _ = (app, title);
+}
+
 // ── Tauri commands (called from the frontend; marshalled onto the main thread) ──
 
 /// Push the currently-playing track's metadata + playback state to the OS.
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
-pub fn media_update(
-    app: AppHandle,
-    title: String,
-    artist: String,
-    album: String,
-    thumbnail: String,
-    duration: f64,
-    elapsed: f64,
-    paused: bool,
-) {
+pub fn media_update(app: AppHandle, now: NowPlaying) {
     #[cfg(target_os = "linux")]
-    crate::mpris::update(&title, &artist, &album, &thumbnail, duration, elapsed, !paused);
+    crate::mpris::update(
+        &now.title,
+        &now.artist,
+        &now.album,
+        &now.thumbnail,
+        now.duration,
+        now.elapsed,
+        !now.paused,
+    );
+    let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
-        apply(title, artist, album, thumbnail, duration, !paused, elapsed);
+        apply(&handle, now);
     });
 }
 
@@ -204,5 +263,6 @@ pub fn media_update(
 pub fn media_clear(app: AppHandle) {
     #[cfg(target_os = "linux")]
     crate::mpris::clear();
-    let _ = app.run_on_main_thread(clear);
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || clear(&handle));
 }
