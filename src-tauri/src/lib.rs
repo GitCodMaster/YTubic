@@ -29,6 +29,8 @@ mod discord;
 #[cfg(target_os = "linux")]
 mod linux_graphics;
 mod media;
+#[cfg(target_os = "linux")]
+mod mpris;
 // Grants the microphone to our own pages without WebView2's dialog; the
 // Playback tab needs it to name and pick output devices. Ported from
 // upstream 8cdb647.
@@ -3406,7 +3408,7 @@ async fn start_stream_server(
 
 /// Show + focus the main window (from tray click or single-instance
 /// re-launch).
-fn show_main_window(app: &tauri::AppHandle) {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
@@ -3660,6 +3662,10 @@ pub fn run() {
             // thread, which souvlaki requires and where the main window's
             // HWND is available.
             media::init(app.handle());
+            // Linux/KDE: a host-owned MPRIS player so the taskbar tooltip gets
+            // media controls (see mpris.rs). No-op on other desktops.
+            #[cfg(target_os = "linux")]
+            mpris::init(app.handle());
             // The NSIS installer registers `ytubic://` for release builds;
             // dev runs and Linux need the runtime registration.
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]

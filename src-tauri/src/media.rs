@@ -192,6 +192,8 @@ pub fn media_update(
     elapsed: f64,
     paused: bool,
 ) {
+    #[cfg(target_os = "linux")]
+    crate::mpris::update(&title, &artist, &album, &thumbnail, duration, elapsed, !paused);
     let _ = app.run_on_main_thread(move || {
         apply(title, artist, album, thumbnail, duration, !paused, elapsed);
     });
@@ -200,5 +202,7 @@ pub fn media_update(
 /// Tell the OS nothing is playing (queue emptied / signed out).
 #[tauri::command]
 pub fn media_clear(app: AppHandle) {
+    #[cfg(target_os = "linux")]
+    crate::mpris::clear();
     let _ = app.run_on_main_thread(clear);
 }

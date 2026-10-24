@@ -17,7 +17,7 @@ import { eqGains, usePlaybackSettings } from "@/lib/store/playback-settings";
 import { useDiscordStore, isDiscordConfigured } from "@/lib/store/discord";
 import { resolveStreamId, useTrackSourceStore } from "@/lib/store/track-source";
 import { pickThumbnail } from "@/components/shared/thumbnail";
-import { IS_WINDOWS } from "@/lib/platform";
+import { IS_LINUX, IS_WINDOWS } from "@/lib/platform";
 // Fork note: Discord/track-meta/playback-position/shuffle restores deferred
 // to a follow-up (see next commit) to keep this port reviewable. Premium
 // gate already removed above.
@@ -31,11 +31,12 @@ import { IS_WINDOWS } from "@/lib/platform";
  * because it belongs to the WebView2 child process and appears as an "Unknown
  * app" duplicate. Everywhere else the web session IS the OS session: macOS
  * feeds WKWebView's Now Playing (which always wins the media keys), and on
- * Linux the entry WebKitGTK publishes over MPRIS is the only one — feeding
- * it directly is also what keeps a metadata-less souvlaki "ytubic" ghost
- * plus WebKit's bare "YTubic" fallback shell from showing up as two players
- * in desktop widgets. Without that, a bare <audio> element leaves
- * next/previous unhandled and the keys do nothing.
+ * Linux the entry WebKitGTK publishes over MPRIS is the one desktop widgets
+ * see — feeding it directly is also what keeps WebKit's bare "YTubic"
+ * fallback shell from showing up as a second player. Without that, a bare
+ * <audio> element leaves next/previous unhandled and the keys do nothing.
+ * On KDE, Rust also registers a host-owned player that supersedes WebKit's
+ * so the taskbar tooltip gets controls (src-tauri/src/mpris.rs).
  *
  * Two <audio> elements exist, one active and one standby. Crossfade
  * preloads the next track on the standby element a few seconds before the
@@ -985,10 +986,12 @@ export function useAudioEngine() {
     };
     const push = () => {
       // Windows alone goes through Rust souvlaki; everywhere else the
-      // web session is the player the desktop sees.
+      // web session is the player the desktop sees. Linux additionally feeds
+      // the host-owned MPRIS player (KDE taskbar tooltip, see mpris.rs) via
+      // the same command; Rust ignores it off KDE.
       if (!IS_WINDOWS && "mediaSession" in navigator) {
         pushWeb();
-        return;
+        if (!IS_LINUX) return;
       }
       const s = usePlaybackStore.getState();
       const t = s.index >= 0 ? s.queue[s.index] : undefined;

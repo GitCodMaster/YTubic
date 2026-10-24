@@ -125,6 +125,9 @@ rand = "0.8"
 # does not expose. Keep this pinned to the version already used by wry so
 # `PlatformWebview::inner()` returns the same type.
 webkit2gtk = "=2.0.2"
+# Our own MPRIS player for KDE Plasma's taskbar tooltip (blocking API; the
+# version tauri's notification/keyring stack already compiles). See src/mpris.rs.
+zbus = "5"
 
 [dev-dependencies]
 # ServiceExt::oneshot for the stream-server routing test.
