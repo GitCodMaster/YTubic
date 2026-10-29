@@ -34,7 +34,7 @@ import { pickHighResThumbnail } from "@/components/shared/thumbnail";
 import { fetchAlbum } from "@/lib/innertube/album";
 import { copyLink } from "@/lib/clipboard";
 import { universalShareUrl } from "@/lib/deep-link";
-import { fetchRadio } from "@/lib/innertube/radio";
+import { fetchVariedRadio } from "@/lib/innertube/radio-variety";
 import { usePlaybackStore } from "@/lib/store/playback";
 import { usePlaybackSettings } from "@/lib/store/playback-settings";
 import { armFadeInto } from "@/lib/fade-request";
@@ -129,10 +129,8 @@ export function useAlbumMenuController(albumId: string, album?: AlbumPage) {
     const seed = items[0];
     if (!seed) return;
     try {
-      const radio = await fetchRadio(seed.id);
-      usePlaybackStore
-        .getState()
-        .playShelfItems([seed, ...radio.filter((t) => t.id !== seed.id)], 0);
+      const radio = await fetchVariedRadio(seed.id, { limit: 40 });
+      usePlaybackStore.getState().playShelfItems([seed, ...radio], 0);
     } catch {
       void play(false);
     }
@@ -188,7 +186,7 @@ export function AlbumMenuItems({
       {crossfadeSec > 0 && somethingPlaying ? (
         <Item onSelect={() => void play(false, true)}>
           <IconTransitionRightFilled />
-          Play now with crossfade
+          Play with crossfade
         </Item>
       ) : null}
       <Item onSelect={() => void play(true)}>

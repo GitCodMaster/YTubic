@@ -59,7 +59,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { getLikedIdsSet } from "@/components/shared/like-buttons";
-import { fetchRadio } from "@/lib/innertube/radio";
+import { fetchVariedRadio } from "@/lib/innertube/radio-variety";
 import { fetchLikedSongs } from "@/lib/innertube/library";
 import {
   addToPlaylist,
@@ -300,7 +300,7 @@ export function TrackMenuItems({
           }}
         >
           <IconTransitionRightFilled />
-          Play now with crossfade
+          Play with crossfade
         </Item>
       ) : null}
       <Item onSelect={() => store().enqueueNext(item)}>
@@ -314,8 +314,7 @@ export function TrackMenuItems({
       <Item
         onSelect={async () => {
           try {
-            const radio = await fetchRadio(item.id);
-            const rest = radio.filter((t) => t.id !== item.id);
+            const rest = await fetchVariedRadio(item.id, { limit: 40 });
             store().playShelfItems([item, ...rest], 0);
           } catch {
             store().playNow(item);

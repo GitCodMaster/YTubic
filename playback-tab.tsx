@@ -8,6 +8,7 @@ import {
   IconHeadphonesFilled,
   IconPlayerPlayFilled,
   IconTransitionRightFilled,
+  IconArrowsShuffle2,
 } from "@tabler/icons-react";
 import {
   DropdownMenu,
@@ -51,6 +52,7 @@ export function PlaybackTab() {
       <BackButtonGroup />
       <Group>
         <ResumeRow />
+        <RadioVarietyRow />
       </Group>
     </TabPane>
   );
@@ -209,6 +211,25 @@ function MonoRow() {
       title="Mono Audio"
       description="Play the same audio in both channels."
       control={<Switch checked={on} onCheckedChange={set} />}
+    />
+  );
+}
+
+function RadioVarietyRow() {
+  const on = usePlaybackSettings((s) => s.radioVariety);
+  const set = usePlaybackSettings((s) => s.setRadioVariety);
+  return (
+    <SettingRow
+      icon={IconArrowsShuffle2}
+      title="Varied Radio & Autoplay"
+      description="Mix more tracks into radio and autoplay and shuffle them a bit, so it isn't the same songs every time."
+      control={
+        <Switch
+          checked={on}
+          onCheckedChange={set}
+          aria-label="Varied Radio & Autoplay"
+        />
+      }
     />
   );
 }

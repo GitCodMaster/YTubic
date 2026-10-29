@@ -8,7 +8,8 @@ import { fetchLikedSongs } from "@/lib/innertube/library";
 import type { ShelfItem } from "@/lib/innertube/types";
 import { getLikedIdsSet } from "@/components/shared/like-buttons";
 import { toggleLiked } from "@/lib/like-actions";
-import { fetchRadio, fetchWatchQueueContinuation } from "@/lib/innertube/radio";
+import { fetchWatchQueueContinuation } from "@/lib/innertube/radio";
+import { fetchVariedRadio } from "@/lib/innertube/radio-variety";
 import { prefetchStream, saveTrackMeta, streamUrlFor } from "@/lib/stream";
 import { AudioGraph, canSelectOutputDevice } from "@/lib/audio-graph";
 import { analyzeTrack, peekAnalysis, planMix } from "@/lib/track-analysis";
@@ -1164,7 +1165,11 @@ export function useAudioEngine() {
     const seedKey = `${seedVideoId}#${radioEpoch}`;
     if (radioFetchedForRef.current === seedKey) return;
     radioFetchedForRef.current = seedKey;
-    fetchRadio(seedVideoId)
+    const queued = usePlaybackStore.getState().queue;
+    fetchVariedRadio(seedVideoId, {
+      exclude: queued.map((t) => t.videoId),
+      alternateSeeds: queued.slice(-5, -1).map((t) => t.videoId),
+    })
       .then((tracks) => {
         // Guard against a stale fetch: the user may have replaced the queue
         // (playNow/setQueue) while the radio request was in flight. Only

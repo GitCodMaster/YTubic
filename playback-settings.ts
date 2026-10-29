@@ -28,6 +28,9 @@ type State = {
   mixBassSwap: boolean;
   /** Start the crossfade as the outro begins and skip silent intros. */
   mixSmartTiming: boolean;
+  /** Radio and autoplay mix in more tracks and shuffle them a bit, instead
+   *  of returning the same list every time. */
+  radioVariety: boolean;
   /** Even out loudness between tracks. */
   normalizeVolume: boolean;
   eqEnabled: boolean;
@@ -49,6 +52,7 @@ type State = {
   setCrossfadeSec: (v: number) => void;
   setMixBassSwap: (v: boolean) => void;
   setMixSmartTiming: (v: boolean) => void;
+  setRadioVariety: (v: boolean) => void;
   setNormalizeVolume: (v: boolean) => void;
   setEqEnabled: (v: boolean) => void;
   setEqPreset: (v: EqPreset) => void;
@@ -86,6 +90,7 @@ export const usePlaybackSettings = create<State>()(
       crossfadeSec: 0,
       mixBassSwap: true,
       mixSmartTiming: true,
+      radioVariety: true,
       normalizeVolume: false,
       eqEnabled: false,
       eqPreset: "flat",
@@ -101,6 +106,7 @@ export const usePlaybackSettings = create<State>()(
         }),
       setMixBassSwap: (mixBassSwap) => set({ mixBassSwap }),
       setMixSmartTiming: (mixSmartTiming) => set({ mixSmartTiming }),
+      setRadioVariety: (radioVariety) => set({ radioVariety }),
       setNormalizeVolume: (normalizeVolume) => set({ normalizeVolume }),
       setEqEnabled: (eqEnabled) => set({ eqEnabled }),
       setEqPreset: (eqPreset) => set({ eqPreset }),

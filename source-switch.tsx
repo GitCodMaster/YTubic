@@ -66,10 +66,14 @@ function GlowPill<T extends string | number>({
   const [intro, setIntro] = useState(true);
   const contentRef = useRef<HTMLDivElement>(null);
   const [fullWidth, setFullWidth] = useState(0);
+  const tapTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     const t = window.setTimeout(() => setIntro(false), 2800);
-    return () => window.clearTimeout(t);
+    return () => {
+      window.clearTimeout(t);
+      window.clearTimeout(tapTimer.current);
+    };
   }, []);
 
   useLayoutEffect(() => {
@@ -91,10 +95,20 @@ function GlowPill<T extends string | number>({
       className="relative -m-3 p-3"
       onPointerEnter={() => setNear(true)}
       onPointerLeave={() => setNear(false)}
-      onFocus={() => setFocused(true)}
+      // Only keyboard focus keeps the pill open. A mouse click also focuses
+      // the button and leaves it focused, which used to hold the pill open
+      // after the cursor had left, so it never folded back up.
+      onFocus={(e) => {
+        if (e.target.matches(":focus-visible")) setFocused(true);
+      }}
       onBlur={() => setFocused(false)}
       onClick={() => {
-        if (!open) setNear(true); // touch: a tap on the dot opens it
+        // Touch: a tap on the dot opens it. There is no "cursor leaves" on a
+        // touch screen, so it folds back by itself a few seconds later.
+        if (open) return;
+        setNear(true);
+        window.clearTimeout(tapTimer.current);
+        tapTimer.current = window.setTimeout(() => setNear(false), 3000);
       }}
     >
       <motion.div
