@@ -491,10 +491,15 @@ function SidebarSignInButton({ relinkId }: { relinkId: string | null }) {
         <Button
           title="Sign in"
           onClick={() => {
-            const call = relinkId
-              ? invoke("relink_account", { id: relinkId })
-              : invoke("start_login");
-            call.catch((e) => toast.error(`Sign-in failed: ${String(e)}`));
+            // `relink_account` is not implemented in this fork's Rust
+            // backend (Tauri answers "Command relink_account not found"),
+            // so signing back in always goes through `start_login`. It
+            // dedups against the stored account, so the same account is
+            // refreshed rather than duplicated.
+            void relinkId;
+            invoke("start_login").catch((e) =>
+              toast.error(`Sign-in failed: ${String(e)}`),
+            );
           }}
           className="grid h-9 w-full grid-cols-[32px_minmax(0,1fr)] items-center gap-0.5 overflow-hidden py-0 ps-0.5 pe-2.5 [&>svg]:justify-self-center"
         >

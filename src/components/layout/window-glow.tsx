@@ -37,7 +37,12 @@ async function extractCoverColor(src: string): Promise<string | null> {
   }
 
   const BUCKETS = 12;
-  const acc = Array.from({ length: BUCKETS }, () => ({ w: 0, r: 0, g: 0, b: 0 }));
+  const acc = Array.from({ length: BUCKETS }, () => ({
+    w: 0,
+    r: 0,
+    g: 0,
+    b: 0,
+  }));
   for (let i = 0; i < data.length; i += 4) {
     const r = data[i] / 255;
     const g = data[i + 1] / 255;
