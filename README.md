@@ -27,21 +27,13 @@ Built as a reaction to the sluggish webview-wrapper experience — YTubic talks 
 
 ## What this fork adds
 
-This is a fork of [NUber-dev/YTubic](https://github.com/NUber-dev/YTubic). On top of the original, it adds:
+This is a fork of [ameenalasady/YTubic](https://github.com/ameenalasady/YTubic). On top of the original, it adds:
 
-- **No Premium gating** — drops upstream's YouTube Music Premium playback gate; streaming and caching are free for every account (the premium store is kept only for the sidebar's informational tier badge)
-- **Linux support** — native build with MPRIS media controls and Secret Service-encrypted cookie storage
-- **Discord Rich Presence** — shows what you're listening to on Discord
-- **Last.fm integration** — scrobbling, now-playing status, loved-tracks sync, and an account card
-- **Playback persistence** — resumes your last track at its saved playhead, and restores scroll position and the last-visited page on launch
-- **Persistent track cache** — cached tracks survive restarts, with real titles/artwork and a search box, bounded to a size limit
-- **Customizable layout** — resizable sidebar and side panel, home page section reordering, pin/hide playlists from the sidebar
-- **Full library sidebar** — automatically lists all your saved/created playlists alongside Liked Songs, not just manually pinned ones
-- **Clickable artist/album links** — jump to an artist or album from any card or the player
-- **Cover art lightbox** — click any cover to view it full-size
-- **Full album release dates** — shows the complete release date when YouTube provides one, not just the year
-- **Artist page shuffle** — shuffle an artist's entire catalogue, re-rolled and randomized each time
-- **Other quality-of-life fixes** — global lyrics on/off toggle, age-restricted track playback, home page refresh button, and various UI polish and performance improvements
+- Fancy outline glow so it actually looks like on the pictures
+- Real music video playback
+- Better crossfades with dj-style transitions
+- Play now with crossfade feature (nowhere else to find)
+- Search in settings
 
 ## Features
 
