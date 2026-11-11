@@ -8,7 +8,6 @@ import {
 } from "react";
 import { motion } from "motion/react";
 import { toast } from "sonner";
-import { IconRefresh } from "@tabler/icons-react";
 import { IconMicrophoneFilled } from "@tabler/icons-react";
 import { playerIconButton } from "@/components/layout/player-chrome";
 import { LyricsReloadButton } from "@/components/layout/lyrics-reload-button";
@@ -93,10 +92,8 @@ export type LyricsViewState = {
   setEnabled: (v: boolean) => void;
   /** Sources that failed to answer at all. */
   failed: LyricsSource[];
-  /** A retry is in flight. */
-  isRetrying: boolean;
-  retryFailed: () => void;
-  /** Re-fetch this track's lyrics from LRCLIB and show them. */
+  /** Re-fetch this track's lyrics from LRCLIB and show them. Sources that
+   *  failed to answer are retried alongside. */
   reload: () => void;
   /** A reload is in flight. */
   reloading: boolean;
@@ -153,8 +150,10 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
   const enabled = useSettingsStore((s) => s.lyricsEnabled);
   const setEnabled = useSettingsStore((s) => s.setLyricsEnabled);
 
-  const { queries, best, isLoading, failed, isRetrying, retryFailed } =
-    useLyricsSources(track, !!track && enabled);
+  const { queries, best, isLoading, failed } = useLyricsSources(
+    track,
+    !!track && enabled,
+  );
 
   const availability = useMemo(() => {
     const acc = {} as Record<LyricsSource, Availability>;
@@ -197,11 +196,17 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
     reloadingRef.current = true;
     setReloading(true);
     try {
-      // `refetch` always goes to the network, whatever the cache holds. The
-      // minimum delay only keeps a fast answer from flickering.
+      // `refetch` always goes to the network, whatever the cache holds. A
+      // source that failed to answer is tried again in the same go, which
+      // is what the old "Try again" button did. The minimum delay only
+      // keeps a fast answer from flickering.
+      const retryOthers = failed
+        .filter((s) => s !== "lrclib")
+        .map((s) => queries[s].refetch());
       const [result] = await Promise.all([
         refetchLrclib(),
         new Promise((r) => setTimeout(r, MIN_RELOAD_MS)),
+        ...retryOthers,
       ]);
       // The track changed while this was in flight: the answer belongs to
       // the old one, so show nothing and say nothing.
@@ -221,7 +226,7 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
       reloadingRef.current = false;
       setReloading(false);
     }
-  }, [track?.videoId, refetchLrclib]);
+  }, [track?.videoId, refetchLrclib, failed, queries]);
 
   return {
     active,
@@ -234,8 +239,6 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
     enabled,
     setEnabled,
     failed,
-    isRetrying,
-    retryFailed,
     reload: () => void reload(),
     reloading,
     reloadCount,
@@ -287,25 +290,16 @@ function LyricsContent({
   }
   if (!state.active) {
     // A source that never answered is not a track without lyrics. Say which
-    // it was and offer another go, rather than the flat "No lyrics found."
-    // that used to cover both and then sat in the disk cache for 24h.
+    // it was, rather than the flat "No lyrics found." that used to cover
+    // both and then sat in the disk cache for 24h. The reload button in the
+    // corner is the way to try again.
     if (state.failed.length > 0) {
       return (
-        <div className="flex flex-col items-start gap-2 px-4 py-2">
-          <p className="text-sm text-muted-foreground">
-            Couldn&apos;t reach{" "}
-            {state.failed.map((s) => SOURCE_LABELS[s]).join(", ")}.
-          </p>
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={state.retryFailed}
-            disabled={state.isRetrying}
-          >
-            <IconRefresh className={state.isRetrying ? "animate-spin" : ""} />
-            {state.isRetrying ? "Trying…" : "Try again"}
-          </Button>
-        </div>
+        <p className="px-4 py-2 text-sm text-muted-foreground">
+          Couldn&apos;t reach{" "}
+          {state.failed.map((s) => SOURCE_LABELS[s]).join(", ")}. Use the reload
+          button to try again.
+        </p>
       );
     }
     return (
