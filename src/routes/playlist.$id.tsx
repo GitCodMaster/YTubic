@@ -364,7 +364,11 @@ function PlaylistPageView() {
       ) : layout === "cards" ? (
         <CardGrid size={cardSize}>
           {visibleTracks.map((track) => (
-            <ShelfCard key={`${track.kind}:${track.id}`} item={track} />
+            <ShelfCard
+              key={`${track.kind}:${track.id}`}
+              item={track}
+              wide
+            />
           ))}
         </CardGrid>
       ) : (

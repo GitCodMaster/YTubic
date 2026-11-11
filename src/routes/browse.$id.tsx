@@ -260,7 +260,7 @@ function BrowseShelf({
       {tracksOnly ? (
         <CardGrid size={cardSize}>
           {items.map((item) => (
-            <ShelfCard key={`${item.kind}:${item.id}`} item={item} />
+            <ShelfCard key={`${item.kind}:${item.id}`} item={item} wide />
           ))}
         </CardGrid>
       ) : (
