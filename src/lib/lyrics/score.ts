@@ -9,6 +9,7 @@ import {
   type ParsedTitle,
 } from "@/lib/lyrics/match";
 import { cleanTrackTitle } from "@/lib/track-meta";
+import { lyricsfileLastStart } from "@/lib/lyrics/parse-lyricsfile";
 
 /**
  * Deciding which search hit is the track we asked for.
@@ -44,6 +45,8 @@ export type ScoreCandidate = {
   duration?: number | null;
   syncedLyrics?: string | null;
   plainLyrics?: string | null;
+  /** Raw YAML Lyricsfile (word-level timings), when LRCLIB has one. */
+  lyricsfile?: string | null;
   instrumental?: boolean;
 };
 
@@ -114,7 +117,7 @@ export function scoreCandidate(
 
   // R1. Test for a non-empty string, not for truthiness: three of the
   // highest-scoring 밤편지 rows carry syncedLyrics: "" and plainLyrics: "".
-  const synced = hasBody(c.syncedLyrics);
+  const synced = hasBody(c.syncedLyrics) || hasBody(c.lyricsfile);
   const plain = hasBody(c.plainLyrics);
   if (!opts.bodyUnknown && !synced && !plain && c.instrumental !== true) {
     return no("empty body");
@@ -171,7 +174,9 @@ export function scoreCandidate(
   // A fifth of probed synced records overrun their own stored duration.
   let suppressSynced = false;
   if (synced && q.durationSec) {
-    const last = lastTimestamp(c.syncedLyrics);
+    const last = hasBody(c.syncedLyrics)
+      ? lastTimestamp(c.syncedLyrics)
+      : lyricsfileLastStart(c.lyricsfile);
     if (last !== null && last > q.durationSec + OVERHANG_TOLERANCE_S) {
       // Right song, unusable timings. Keep the record only if it can still
       // answer in plain text.
@@ -297,9 +302,12 @@ export function selectBest<T extends ScoreCandidate>(
 }
 
 function bodyKey(c: ScoreCandidate, v: Verdict): string {
-  const body = !v.suppressSynced && hasBody(c.syncedLyrics)
-    ? c.syncedLyrics!
-    : (c.plainLyrics ?? "");
+  const body =
+    !v.suppressSynced && hasBody(c.syncedLyrics)
+      ? c.syncedLyrics!
+      : hasBody(c.plainLyrics)
+        ? c.plainLyrics!
+        : (c.lyricsfile ?? "");
   // Normalizing collapses the punctuation and casing differences between
   // otherwise identical uploads of one transcription.
   return normalizeForScore(body).slice(0, 400);
@@ -337,8 +345,12 @@ function pickWithinGroup<T extends ScoreCandidate>(
       const db = Math.abs((usableDuration(b.record.duration) ?? Infinity) - mode);
       if (da !== db) return da - db;
     }
-    const sa = !a.verdict.suppressSynced && hasBody(a.record.syncedLyrics);
-    const sb = !b.verdict.suppressSynced && hasBody(b.record.syncedLyrics);
+    const sa =
+      !a.verdict.suppressSynced &&
+      (hasBody(a.record.syncedLyrics) || hasBody(a.record.lyricsfile));
+    const sb =
+      !b.verdict.suppressSynced &&
+      (hasBody(b.record.syncedLyrics) || hasBody(b.record.lyricsfile));
     if (sa !== sb) return sa ? -1 : 1;
     return (b.record.plainLyrics?.length ?? 0) - (a.record.plainLyrics?.length ?? 0);
   });

@@ -1,6 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import type { Lyrics } from "@/lib/lyrics/types";
 import { parseLRC } from "@/lib/lyrics/parse-lrc";
+import { parseLyricsfile } from "@/lib/lyrics/parse-lyricsfile";
 import { romanizedArtist } from "@/lib/lyrics/match";
 import { selectBest, type ScoreQuery } from "@/lib/lyrics/score";
 import { reattributedFromTitle } from "@/lib/track-meta";
@@ -61,6 +62,12 @@ type LrclibParams = {
   album?: string;
   /** Duration in seconds. LRCLIB uses this to disambiguate matches. */
   duration?: number;
+  /**
+   * The individual credited artists. `artist` is these joined with ", ",
+   * which LRCLIB's artist filter cannot match when it stores only one of
+   * them. Used for a second round of lookups when the first finds nothing.
+   */
+  artists?: string[];
 };
 
 type LrclibRecord = {
@@ -71,6 +78,8 @@ type LrclibRecord = {
   duration?: number;
   plainLyrics?: string | null;
   syncedLyrics?: string | null;
+  /** Raw YAML Lyricsfile: the only place LRCLIB keeps word timings. */
+  lyricsfile?: string | null;
   instrumental?: boolean;
 };
 
@@ -150,14 +159,46 @@ async function lookup(
     artist: p.artist,
     durationSec: p.duration,
   };
-  const best = selectBest(query, [...(get ? [get] : []), ...search]);
+  const pool = [...(get ? [get] : []), ...search];
+  const best = selectBest(query, pool);
   if (best) return mapRecord(best.record, best.verdict.suppressSynced);
 
   // Nothing survived scoring. Whether that is an answer depends on whether
   // both endpoints actually answered.
   if (searchR.status === "rejected") throw searchR.reason;
   if (getR.status === "rejected") throw getR.reason;
-  return null;
+
+  // Both answered and nothing matched. With several credited artists that
+  // is usually the retrieval, not the song: LRCLIB's /search filters
+  // artist_name by containment and /get needs it exact, and most records
+  // are filed under just one of the credits ("DVRST" for a track YouTube
+  // Music lists as "DVRST, safetypleace, Nia.wave"). So ask again with each
+  // artist on its own. The scorer still verifies against the FULL credit
+  // (subset credits are free there), so this widens what is fetched
+  // without loosening what is accepted.
+  const singles = [...new Set(p.artists ?? [])]
+    .filter((a) => a && a !== p.artist)
+    .slice(0, 3);
+  if (singles.length === 0) return null;
+
+  const extra = await Promise.allSettled([
+    lrclibGet({ ...p, artist: singles[0] }, deadline),
+    ...singles.map((a) => lrclibSearch({ ...p, artist: a }, deadline)),
+  ]);
+  const extraPool: LrclibRecord[] = [];
+  let anyFulfilled = false;
+  for (const r of extra) {
+    if (r.status !== "fulfilled") continue;
+    anyFulfilled = true;
+    if (Array.isArray(r.value)) extraPool.push(...r.value);
+    else if (r.value) extraPool.push(r.value);
+  }
+  if (!anyFulfilled) {
+    const failed = extra.find((r) => r.status === "rejected");
+    if (failed && failed.status === "rejected") throw failed.reason;
+  }
+  const retry = selectBest(query, extraPool);
+  return retry ? mapRecord(retry.record, retry.verdict.suppressSynced) : null;
 }
 
 async function lrclibGet(
@@ -208,6 +249,19 @@ function mapRecord(
 ): Lyrics | null {
   if (r.instrumental) {
     return { kind: "plain", text: "🎵 Instrumental", source: "LRCLIB" };
+  }
+  // The Lyricsfile wins when there is one: it is the same song with
+  // per-word timings, and LRCLIB says clients that understand it should
+  // prefer it over the legacy fields it was derived from.
+  if (
+    !suppressSynced &&
+    typeof r.lyricsfile === "string" &&
+    r.lyricsfile.trim()
+  ) {
+    const lines = parseLyricsfile(r.lyricsfile);
+    if (lines.length > 0) {
+      return { kind: "timed", lines, source: "LRCLIB" };
+    }
   }
   if (
     !suppressSynced &&

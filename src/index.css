@@ -834,6 +834,26 @@
     transition-timing-function: cubic-bezier(0.32, 0.72, 0, 1);
   }
 
+  /* Word-synced lyrics: the lit copy of a word is revealed left to right
+     by a soft mask edge. `--p` (0..1) is set per frame from lyrics-view's
+     WordLine. The edge (`--e`) is mapped so p=0 shows nothing and p=1
+     shows the whole word, with the feathered edge always inside the
+     range in between. */
+  .lyrics-word-fill {
+    --p: 0;
+    --e: 0.5em;
+    -webkit-mask-image: linear-gradient(
+      90deg,
+      #000 calc(var(--p) * (100% + var(--e)) - var(--e)),
+      transparent calc(var(--p) * (100% + var(--e)))
+    );
+    mask-image: linear-gradient(
+      90deg,
+      #000 calc(var(--p) * (100% + var(--e)) - var(--e)),
+      transparent calc(var(--p) * (100% + var(--e)))
+    );
+  }
+
   /* Fine SVG noise overlaid on the heavily-blurred `BackgroundCover` art.
      Without it, `blur-3xl` produces gradients smooth enough to lose
      precision through 8-bit channel quantization — especially in the

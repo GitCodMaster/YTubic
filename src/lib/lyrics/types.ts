@@ -9,7 +9,23 @@ export type TimedLine = {
   start: number;
   end?: number;
   text: string;
+  /** Per-word timings, when the source has them (LRCLIB Lyricsfile). */
+  words?: TimedWord[];
 };
+
+/** One word (or syllable/phrase) of a word-synced line, in seconds. */
+export type TimedWord = {
+  start: number;
+  end: number;
+  text: string;
+};
+
+/** True when at least one line carries word timings. */
+export function hasWordSync(l: Lyrics | null | undefined): boolean {
+  return (
+    l?.kind === "timed" && l.lines.some((x) => (x.words?.length ?? 0) > 0)
+  );
+}
 
 export type Lyrics =
   | { kind: "timed"; lines: TimedLine[]; source?: string }

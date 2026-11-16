@@ -5,8 +5,12 @@ import { fetchMusixmatchLyrics } from "@/lib/lyrics/musixmatch";
 import { fetchGeniusLyrics } from "@/lib/lyrics/genius";
 import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
 import { shouldRetryLyricsQuery } from "@/lib/lyrics/http";
-import { cleanTrackTitle, lyricsArtist } from "@/lib/track-meta";
-import type { Lyrics } from "@/lib/lyrics/types";
+import {
+  cleanTrackTitle,
+  lyricsArtist,
+  lyricsArtistList,
+} from "@/lib/track-meta";
+import { hasWordSync, type Lyrics } from "@/lib/lyrics/types";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
 
 export type LyricsSource = "ytmusic" | "lrclib" | "musixmatch" | "genius";
@@ -38,7 +42,7 @@ const ONE_HOUR = 60 * 60 * 1000;
  * user keeps yesterday's answer, looked up with yesterday's broken title
  * and artist, for a day after installing the fix.
  */
-const LOOKUP_VERSION = "v3";
+const LOOKUP_VERSION = "v4";
 
 /**
  * Fire both lyric queries in parallel, plus a derived "best" selection.
@@ -55,6 +59,7 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
   // position tick, while the answer only changes when the track does. The
   // work is small either way; this just keeps it off the hot path.
   const artistName = useMemo(() => lyricsArtist(track), [track]);
+  const artistList = useMemo(() => lyricsArtistList(track), [track]);
   const trackTitle = useMemo(
     () => (track ? cleanTrackTitle(track.title) : undefined),
     [track],
@@ -111,6 +116,7 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
           artist: artistName,
           album: track?.album,
           duration,
+          artists: artistList,
         },
         signal,
       ),
@@ -157,10 +163,20 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
   };
 
   let best: LyricsSource | null = null;
+  // Word-synced lyrics beat line-synced ones, whichever source has them:
+  // only LRCLIB can provide them, and it ranks below YouTube Music.
   for (const s of SOURCE_ORDER) {
-    if (queries[s].data?.kind === "timed") {
+    if (hasWordSync(queries[s].data)) {
       best = s;
       break;
+    }
+  }
+  if (!best) {
+    for (const s of SOURCE_ORDER) {
+      if (queries[s].data?.kind === "timed") {
+        best = s;
+        break;
+      }
     }
   }
   if (!best) {

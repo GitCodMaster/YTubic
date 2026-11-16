@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -35,7 +36,12 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { Lyrics, TimedLine } from "@/lib/lyrics/types";
+import {
+  hasWordSync,
+  type Lyrics,
+  type TimedLine,
+  type TimedWord,
+} from "@/lib/lyrics/types";
 import {
   SOURCE_LABELS,
   SOURCE_ORDER,
@@ -54,7 +60,7 @@ type Pref = LyricsSource | "auto";
 /** "none" means the source answered and has nothing. "error" means it never
  *  answered. Keeping them apart is the whole point of the provider change:
  *  an unreachable source must stay selectable so the user can retry it. */
-type Availability = "lrc" | "plain" | "loading" | "none" | "error";
+type Availability = "words" | "lrc" | "plain" | "loading" | "none" | "error";
 
 function loadPref(): Pref {
   try {
@@ -161,7 +167,9 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
       const q = queries[s];
       acc[s] = q.data
         ? q.data.kind === "timed"
-          ? "lrc"
+          ? hasWordSync(q.data)
+            ? "words"
+            : "lrc"
           : "plain"
         : q.isLoading
           ? "loading"
@@ -597,7 +605,11 @@ function TimedLyrics({
                     : "scale-100 text-muted-foreground/70",
               )}
             >
-              {line.text || "♪"}
+              {isActive && line.words?.length ? (
+                <WordLine words={line.words} />
+              ) : (
+                line.text || "♪"
+              )}
             </button>
           );
         })}
@@ -624,6 +636,104 @@ function TimedLyrics({
         className="lyrics-blur-overlay-bottom pointer-events-none absolute inset-x-0 bottom-0 h-[26%]"
       />
     </div>
+  );
+}
+
+/**
+ * The active line of word-synced lyrics.
+ *
+ * Every word is drawn twice: a dim base, and a lit copy on top whose mask
+ * edge sweeps across it as the word is sung (`--p` goes 0 to 1, see
+ * `.lyrics-word-fill` in index.css). Progress is written straight to the
+ * DOM from a rAF loop instead of through React state, so the ~10-20 words
+ * of a line cost no re-renders.
+ *
+ * The playback store only reports the position a few times a second
+ * (`timeupdate`), far too coarse for a word that lasts 200 ms. Between
+ * reports the position is extrapolated from the last one, capped so a
+ * stalled stream cannot run the highlight away.
+ */
+const EXTRAPOLATE_CAP_S = 0.6;
+
+function WordLine({ words }: { words: TimedWord[] }) {
+  const fills = useRef<(HTMLSpanElement | null)[]>([]);
+
+  useEffect(() => {
+    const anchor = {
+      pos: useScrubStore.getState().scrub ?? usePlaybackStore.getState().position,
+      ts: performance.now(),
+    };
+    const reanchor = () => {
+      anchor.pos =
+        useScrubStore.getState().scrub ?? usePlaybackStore.getState().position;
+      anchor.ts = performance.now();
+    };
+    const unsubPlayback = usePlaybackStore.subscribe((s, prev) => {
+      if (s.position !== prev.position || s.playing !== prev.playing) {
+        reanchor();
+      }
+    });
+    const unsubScrub = useScrubStore.subscribe(reanchor);
+
+    const last: number[] = [];
+    let raf = 0;
+    const tick = () => {
+      const scrub = useScrubStore.getState().scrub;
+      let t = anchor.pos;
+      if (scrub === null && usePlaybackStore.getState().playing) {
+        t += Math.min((performance.now() - anchor.ts) / 1000, EXTRAPOLATE_CAP_S);
+      }
+      for (let i = 0; i < words.length; i++) {
+        const el = fills.current[i];
+        if (!el) continue;
+        const w = words[i];
+        const span = Math.max(w.end - w.start, 0.05);
+        const p = Math.min(1, Math.max(0, (t - w.start) / span));
+        // Skip untouched words (before or after the one being sung).
+        if (last[i] === p) continue;
+        last[i] = p;
+        el.style.setProperty("--p", p.toFixed(3));
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      unsubPlayback();
+      unsubScrub();
+    };
+  }, [words]);
+
+  return (
+    <>
+      {words.map((w, i) => {
+        const m = /^(\s*)([\s\S]*?)(\s*)$/.exec(w.text);
+        const lead = m?.[1] ?? "";
+        const core = m?.[2] ?? w.text;
+        const trail = m?.[3] ?? "";
+        return (
+          <Fragment key={i}>
+            {lead}
+            {core ? (
+              <span className="relative inline-block whitespace-nowrap">
+                <span className="opacity-40">{core}</span>
+                <span
+                  aria-hidden
+                  className="lyrics-word-fill absolute inset-0"
+                  ref={(el) => {
+                    fills.current[i] = el;
+                  }}
+                  style={{ "--p": 0 } as React.CSSProperties}
+                >
+                  {core}
+                </span>
+              </span>
+            ) : null}
+            {trail}
+          </Fragment>
+        );
+      })}
+    </>
   );
 }
 
@@ -704,7 +814,7 @@ export function LyricsSourceButton({
           {SOURCE_ORDER.map((s) => {
             const a = availability[s];
             const dot =
-              a === "lrc"
+              a === "lrc" || a === "words"
                 ? "bg-brand"
                 : a === "plain"
                   ? "bg-muted-foreground/60"
@@ -723,6 +833,11 @@ export function LyricsSourceButton({
                 disabled={!enabled || a === "none"}
               >
                 <span className="flex-1">{SOURCE_LABELS[s]}</span>
+                {a === "words" ? (
+                  <span className="ml-2 text-[10px] uppercase tracking-wide text-muted-foreground">
+                    Words
+                  </span>
+                ) : null}
                 <span
                   className={cn("ml-2 size-1.5 shrink-0 rounded-full", dot)}
                 />

@@ -186,6 +186,15 @@ export function artistsFromList(
   return joined || undefined;
 }
 
+/** The individual credited artists, de-Topic'd, in order. */
+export function lyricsArtistList(
+  track: TrackMetaLike | undefined,
+): string[] {
+  return (track?.artists ?? [])
+    .map((a) => stripTopicSuffix(a.name ?? ""))
+    .filter(Boolean);
+}
+
 /**
  * Re-uploads invert the usual arrangement: the real artist is in the title
  * and the artist field holds the uploader's channel name.
