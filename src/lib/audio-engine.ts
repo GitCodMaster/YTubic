@@ -75,8 +75,29 @@ type Fade = {
   timer: number;
 };
 
+/** One of the player's two <audio> elements. */
+function makeElement(): HTMLAudioElement {
+  const el = new Audio();
+  el.preload = "auto";
+  // Streams come from our own axum server (streamUrlFor), which answers
+  // with CORS headers, so the element can be read by the WebAudio graph.
+  // Without this the graph would play silence.
+  el.crossOrigin = "anonymous";
+  return el;
+}
+
 /** Perceived-loudness curve for the volume slider (see the volume effect). */
 const elementVolume = (volume: number) => Math.max(0, Math.min(1, volume)) ** 3;
+
+/** Set an element's level (0..1, after the slider curve) or mute. Once the
+ *  graph is built these go to the element's fader instead; see
+ *  AudioGraph.setVolume. */
+function setElVolume(g: AudioGraph | null, el: HTMLAudioElement, v: number) {
+  if (!g?.setVolume(el, v)) el.volume = v;
+}
+function setElMuted(g: AudioGraph | null, el: HTMLAudioElement, m: boolean) {
+  if (!g?.setMuted(el, m)) el.muted = m;
+}
 
 export function useAudioEngine() {
   // The element currently owning playback; `audioRef` keeps the name the
@@ -84,6 +105,12 @@ export function useAudioEngine() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const standbyRef = useRef<HTMLAudioElement | null>(null);
   const graphRef = useRef<AudioGraph | null>(null);
+  // Bumped when the graph is built or closed, so the output-device effect
+  // re-applies the sink to whichever path is rendering.
+  const [graphGen, setGraphGen] = useState(0);
+  // Bumped when closing the graph swaps in a fresh pair of elements, so
+  // the event wiring moves over to them.
+  const [elementsGen, setElementsGen] = useState(0);
   const pendingRef = useRef<PendingNext | null>(null);
   const fadeRef = useRef<Fade | null>(null);
   // Set when a crossfade moves the store to the next track: the resolve
@@ -128,19 +155,8 @@ export function useAudioEngine() {
   // Ensure the pair of <audio> elements exists.
   useEffect(() => {
     if (audioRef.current) return;
-    const make = () => {
-      const el = new Audio();
-      el.preload = "auto";
-      // Streams come from our own axum server (streamUrlFor), which
-      // answers with CORS headers, so the element can be read by the
-      // WebAudio graph. Without this the graph would play silence.
-      el.crossOrigin = "anonymous";
-      return el;
-    };
-    const a = make();
-    const b = make();
-    audioRef.current = a;
-    standbyRef.current = b;
+    audioRef.current = makeElement();
+    standbyRef.current = makeElement();
     {
       const s = usePlaybackStore.getState();
       const t = s.index >= 0 ? s.queue[s.index] : undefined;
@@ -156,13 +172,14 @@ export function useAudioEngine() {
         };
       }
     }
+    const refs = [audioRef, standbyRef];
     return () => {
-      for (const el of [a, b]) {
-        el.pause();
-        el.src = "";
+      // Read at unmount: closing the graph may have replaced the pair.
+      for (const ref of refs) {
+        ref.current?.pause();
+        ref.current?.removeAttribute("src");
+        ref.current = null;
       }
-      audioRef.current = null;
-      standbyRef.current = null;
     };
   }, []);
 
@@ -185,7 +202,11 @@ export function useAudioEngine() {
     f.from.pause();
     f.from.removeAttribute("src");
     f.from.load();
-    f.to.volume = elementVolume(usePlaybackStore.getState().volume);
+    setElVolume(
+      graphRef.current,
+      f.to,
+      elementVolume(usePlaybackStore.getState().volume),
+    );
     graphRef.current?.resetBass();
   };
 
@@ -198,14 +219,22 @@ export function useAudioEngine() {
       const base = elementVolume(usePlaybackStore.getState().volume);
       const t = Math.min(1, (performance.now() - started) / ms);
       // Equal-power ramp: the sum of the two stays at a steady loudness.
-      fade.from.volume = base * Math.cos((t * Math.PI) / 2);
-      fade.to.volume = base * Math.sin((t * Math.PI) / 2);
+      setElVolume(
+        graphRef.current,
+        fade.from,
+        base * Math.cos((t * Math.PI) / 2),
+      );
+      setElVolume(
+        graphRef.current,
+        fade.to,
+        base * Math.sin((t * Math.PI) / 2),
+      );
       if (t >= 1) onDone();
     }, CROSSFADE_TICK_MS);
   };
 
   /** Build the WebAudio graph on first need and route both elements
-   *  through it. One-way: elements cannot be detached again. */
+   *  through it. Elements cannot be detached again; see `releaseGraph`. */
   const ensureGraph = (): AudioGraph | null => {
     if (graphRef.current) return graphRef.current;
     if (typeof AudioContext === "undefined") return null;
@@ -215,11 +244,73 @@ export function useAudioEngine() {
       for (const el of [audioRef.current, standbyRef.current]) {
         if (el) g.attach(el);
       }
+      setGraphGen((n) => n + 1);
       return g;
     } catch (e) {
       if (import.meta.env.DEV) console.error("[audio] graph failed:", e);
       return null;
     }
+  };
+
+  /**
+   * Close the graph once nothing needs it, and move playback to a fresh
+   * pair of elements: the attached ones can only ever play through the
+   * graph. The current track is reloaded at the same position, so turning
+   * the equaliser off costs a short gap. It also gets the plain <audio>
+   * path back if the graph's output has failed for any reason.
+   */
+  const releaseGraph = () => {
+    const g = graphRef.current;
+    const from = audioRef.current;
+    const spare = standbyRef.current;
+    if (!g || !from || !spare) return;
+    // Both elements are dropped below, so a running mix or a preload only
+    // needs forgetting. The active element is the incoming track mid-mix.
+    if (fadeRef.current) window.clearInterval(fadeRef.current.timer);
+    fadeRef.current = null;
+    pendingRef.current = null;
+    const st = usePlaybackStore.getState();
+    const to = makeElement();
+    const standby = makeElement();
+    to.volume = elementVolume(st.volume);
+    to.muted = st.muted;
+    standby.muted = st.muted;
+    const src = from.getAttribute("src");
+    if (src) {
+      const at = from.currentTime;
+      const resume = !from.paused;
+      to.src = src;
+      to.addEventListener(
+        "loadedmetadata",
+        () => {
+          try {
+            to.currentTime = at;
+          } catch {
+            /* seek failed: start from the top */
+          }
+          if (resume && usePlaybackStore.getState().playing) {
+            void to.play().catch((e) => {
+              if (e?.name === "AbortError") return;
+              usePlaybackStore
+                .getState()
+                .setStatus("error", e?.message ?? String(e));
+            });
+          }
+        },
+        { once: true },
+      );
+    }
+    for (const el of [from, spare]) {
+      el.pause();
+      el.removeAttribute("src");
+      el.load();
+    }
+    audioRef.current = to;
+    standbyRef.current = standby;
+    graphRef.current = null;
+    void g.close();
+    setElementsGen((n) => n + 1);
+    setGraphGen((n) => n + 1);
   };
 
   // Wire element → store events. Both elements are listened to; events
@@ -331,8 +422,8 @@ export function useAudioEngine() {
     ) => {
       const to = next.el;
       pendingRef.current = null;
-      to.muted = store().muted;
-      to.volume = 0;
+      setElMuted(graphRef.current, to, store().muted);
+      setElVolume(graphRef.current, to, 0);
       // Swap roles first so the incoming element's `playing` counts as
       // the active one, then tell the store, whose track change the
       // resolve effect below recognises via adoptRef and leaves alone.
@@ -484,7 +575,8 @@ export function useAudioEngine() {
         el.removeEventListener("waiting", onWaiting);
       }
     };
-  }, []);
+    // `elementsGen`: closing the graph replaces both elements.
+  }, [elementsGen]);
 
   // React to current-track changes → resolve stream → set src.
   const { videoId, track, index } = usePlaybackStore(
@@ -568,8 +660,8 @@ export function useAudioEngine() {
       audioRef.current = to;
       standbyRef.current = from;
       loadedStreamRef.current = streamVideoId;
-      to.muted = st.muted;
-      to.volume = 0;
+      setElMuted(graphRef.current, to, st.muted);
+      setElVolume(graphRef.current, to, 0);
       st.setStatus("loading");
       void saveTrackMeta(
         streamVideoId,
@@ -631,8 +723,8 @@ export function useAudioEngine() {
       const to = standbyRef.current;
       const newId = streamVideoId;
       const token = ++resolveTokenRef.current;
-      to.muted = from.muted;
-      to.volume = 0;
+      setElMuted(graphRef.current, to, usePlaybackStore.getState().muted);
+      setElVolume(graphRef.current, to, 0);
       const fail = () => {
         if (token !== resolveTokenRef.current) return;
         to.removeAttribute("src");
@@ -664,7 +756,7 @@ export function useAudioEngine() {
             } else {
               // Paused while it loaded: swap in place, no ramp.
               to.pause();
-              to.volume = elementVolume(st.volume);
+              setElVolume(graphRef.current, to, elementVolume(st.volume));
               from.pause();
               from.removeAttribute("src");
               from.load();
@@ -855,16 +947,17 @@ export function useAudioEngine() {
     // Apply a cubic curve so the slider tracks perceived loudness.
     // During a crossfade the ramp owns both elements' volumes and reads
     // the store's value on every tick, so only mute is applied here.
-    if (!fadeRef.current) el.volume = elementVolume(volume);
-    el.muted = muted;
+    if (!fadeRef.current)
+      setElVolume(graphRef.current, el, elementVolume(volume));
+    setElMuted(graphRef.current, el, muted);
     const standby = standbyRef.current;
-    if (standby) standby.muted = muted;
+    if (standby) setElMuted(graphRef.current, standby, muted);
   }, [volume, muted]);
 
   // Equaliser, mono and normalisation follow the Playback settings. The
   // graph is built the first time any of them is switched on (or an output
-  // device is chosen) and stays for the session; while all are off it is
-  // never built, so a plain <audio> path remains the default.
+  // device is chosen), and closed again once all of them are off, so a
+  // plain <audio> path is the default.
   const {
     eqEnabled,
     eqPreset,
@@ -892,7 +985,11 @@ export function useAudioEngine() {
     outputDeviceId !== "" ||
     (crossfadeSec > 0 && mixBassSwap);
   useEffect(() => {
-    const g = wantsGraph ? ensureGraph() : graphRef.current;
+    if (!wantsGraph) {
+      releaseGraph();
+      return;
+    }
+    const g = ensureGraph();
     if (!g) return;
     g.setEq(eqEnabled, eqGains({ eqPreset, eqCustomGains }));
     g.setMono(monoAudio);
@@ -923,9 +1020,9 @@ export function useAudioEngine() {
     void apply.catch((e) => {
       if (import.meta.env.DEV) console.warn("[audio] setSinkId failed:", e);
     });
-    // `wantsGraph` so the sink is re-applied on the context the moment the
-    // graph takes over rendering from the elements.
-  }, [outputDeviceId, wantsGraph]);
+    // `graphGen` so the sink is re-applied the moment the graph takes over
+    // rendering from the elements, or hands it back.
+  }, [outputDeviceId, graphGen]);
 
   // Handle seek requests.
   const pendingSeek = usePlaybackStore((s) => s.pendingSeek);

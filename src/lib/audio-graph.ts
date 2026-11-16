@@ -3,18 +3,27 @@ import { EQ_BANDS } from "@/lib/store/playback-settings";
 /**
  * The WebAudio chain behind the player's <audio> elements:
  *
- *   element(s) -> head -> 9 x BiquadFilter -> mono -> [compressor] -> destination
+ *   element -> fader -> deck bass -> head -> 9 x BiquadFilter -> mono
+ *     -> [compressor] -> destination
  *
  * Built lazily by the audio engine the first time the equaliser, mono,
- * normalisation or a non-default output device is switched on. Once an
- * element is attached through `createMediaElementSource` it can never be
- * detached, so the graph is a one-way door: everything after that plays
- * through here, and every stage is transparent while its setting is off.
+ * normalisation or a non-default output device is switched on. An element
+ * attached through `createMediaElementSource` can never be detached, so
+ * when all of those are off again the engine closes the graph and moves
+ * playback to a fresh pair of elements (see `close`). Every stage is
+ * transparent while its setting is off.
+ *
+ * On Linux the context's output relies on the bundled GStreamer sink
+ * (src-tauri/gst-plugin): with WebKitGTK's stock pulsesink it plays pure
+ * silence on high-latency outputs such as Bluetooth headphones.
  *
  * The elements must load their stream with `crossOrigin="anonymous"` and
  * the stream server must answer with CORS headers (it does, through the
  * permissive `CorsLayer` on the axum router); a tainted element does not
  * throw here, it just yields silence.
+ *
+ * Once an element is attached its own `volume` and `muted` are left at 1
+ * and off, and its fader carries the level instead (see `setVolume`).
  */
 
 /** `setSinkId` is missing from the DOM lib on AudioContext. */
@@ -25,6 +34,14 @@ const dbToGain = (db: number) => 10 ** (db / 20);
 /** How far the bass of a track is pulled down while it is not "on deck". */
 const MIX_BASS_CUT_DB = -32;
 
+/** One attached element: its level and its DJ-mix low shelf. */
+type Deck = {
+  fader: GainNode;
+  bass: BiquadFilterNode;
+  volume: number;
+  muted: boolean;
+};
+
 export class AudioGraph {
   readonly ctx: AudioContext;
   private readonly head: GainNode;
@@ -33,9 +50,7 @@ export class AudioGraph {
   private readonly compressor: DynamicsCompressorNode;
   private readonly tail: GainNode;
   private normalize = false;
-  private readonly sources = new WeakSet<HTMLMediaElement>();
-  /** Per-element low shelf, used to swap basslines during a DJ mix. */
-  private readonly decks = new Map<HTMLMediaElement, BiquadFilterNode>();
+  private readonly decks = new Map<HTMLMediaElement, Deck>();
 
   constructor() {
     const ctx = new AudioContext({ latencyHint: "playback" });
@@ -85,17 +100,61 @@ export class AudioGraph {
     this.tail.connect(ctx.destination);
   }
 
-  /** Route an element through the graph. Idempotent per element. */
+  /**
+   * Route an element through the graph. Idempotent per element. The
+   * element's current volume and mute move onto its fader, and the
+   * element itself is set to full volume, unmuted.
+   */
   attach(el: HTMLMediaElement): void {
-    if (this.sources.has(el)) return;
-    this.sources.add(el);
+    if (this.decks.has(el)) return;
+    const fader = this.ctx.createGain();
     const bass = this.ctx.createBiquadFilter();
     bass.type = "lowshelf";
     bass.frequency.value = 220;
     bass.gain.value = 0;
-    this.ctx.createMediaElementSource(el).connect(bass);
+    const deck: Deck = { fader, bass, volume: el.volume, muted: el.muted };
+    fader.gain.value = deck.muted ? 0 : deck.volume;
+    this.ctx.createMediaElementSource(el).connect(fader);
+    fader.connect(bass);
     bass.connect(this.head);
-    this.decks.set(el, bass);
+    this.decks.set(el, deck);
+    el.volume = 1;
+    el.muted = false;
+  }
+
+  /**
+   * An attached element's level, on the same 0..1 scale as
+   * `HTMLMediaElement.volume`. Returns false for an element the graph
+   * does not own, which should then be set directly.
+   *
+   * The element's own volume can't be used once it is attached:
+   * WebKitGTK taps the audio before the element's volume and mute are
+   * applied, so they stop doing anything, while Chromium applies them
+   * before the graph, so using both there would apply the level twice.
+   */
+  setVolume(el: HTMLMediaElement, volume: number): boolean {
+    const deck = this.decks.get(el);
+    if (!deck) return false;
+    deck.volume = volume;
+    this.applyLevel(deck);
+    return true;
+  }
+
+  /** Mute counterpart of `setVolume`. */
+  setMuted(el: HTMLMediaElement, muted: boolean): boolean {
+    const deck = this.decks.get(el);
+    if (!deck) return false;
+    deck.muted = muted;
+    this.applyLevel(deck);
+    return true;
+  }
+
+  private applyLevel(deck: Deck): void {
+    const t = this.ctx.currentTime;
+    const g = deck.fader.gain;
+    g.cancelScheduledValues(t);
+    // A short glide so the 40 ms crossfade steps and mute don't click.
+    g.setTargetAtTime(deck.muted ? 0 : deck.volume, t, 0.01);
   }
 
   /**
@@ -109,8 +168,8 @@ export class AudioGraph {
     incoming: HTMLMediaElement,
     seconds: number,
   ): void {
-    const out = this.decks.get(outgoing);
-    const inn = this.decks.get(incoming);
+    const out = this.decks.get(outgoing)?.bass;
+    const inn = this.decks.get(incoming)?.bass;
     if (!out || !inn) return;
     const t = this.ctx.currentTime;
     out.gain.cancelScheduledValues(t);
@@ -126,9 +185,9 @@ export class AudioGraph {
   /** Restore full bass on every deck (mix finished or cancelled). */
   resetBass(): void {
     const t = this.ctx.currentTime;
-    for (const f of this.decks.values()) {
-      f.gain.cancelScheduledValues(t);
-      f.gain.setTargetAtTime(0, t, 0.03);
+    for (const { bass } of this.decks.values()) {
+      bass.gain.cancelScheduledValues(t);
+      bass.gain.setTargetAtTime(0, t, 0.03);
     }
   }
 
@@ -171,6 +230,13 @@ export class AudioGraph {
     } else {
       this.mono.connect(this.tail);
     }
+  }
+
+  /** Stop rendering for good. The attached elements stay tied to this
+   *  context and go silent with it, so they must not be used again. */
+  close(): Promise<void> {
+    this.decks.clear();
+    return this.ctx.close().catch(() => {});
   }
 
   /** Move the whole context to an output device; "" is the default. */
