@@ -123,11 +123,20 @@ export function scoreCandidate(
     return no("empty body");
   }
 
-  const qTitle = parseTitle(cleanTrackTitle(q.title), q.artist);
+  // Both titles are cleaned against BOTH credits. LRCLIB files "DVRST,
+  // monrxe - Darling" under the artist "DVRST" alone, so the candidate's own
+  // artist cannot explain the "monrxe" in its title; the request's can.
+  const credits = [q.artist, c.artistName]
+    .filter((x): x is string => !!x?.trim())
+    .join(", ");
+  const qTitle = parseTitle(cleanTrackTitle(q.title), credits || undefined);
   // The candidate title gets the same cleanup as ours: LRCLIB stores rows
   // like "Marshmello - Alone (Official Music Video)", which is a correct
   // record scoring 0.22 raw and 1.000 once cleaned.
-  const cTitle = parseTitle(cleanTrackTitle(c.trackName ?? ""), c.artistName);
+  const cTitle = parseTitle(
+    cleanTrackTitle(c.trackName ?? ""),
+    credits || undefined,
+  );
 
   const artistKnown = !!q.artist?.trim() && !!c.artistName?.trim();
 

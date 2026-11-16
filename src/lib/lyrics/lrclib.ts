@@ -3,7 +3,11 @@ import type { Lyrics } from "@/lib/lyrics/types";
 import { parseLRC } from "@/lib/lyrics/parse-lrc";
 import { parseLyricsfile } from "@/lib/lyrics/parse-lyricsfile";
 import { romanizedArtist } from "@/lib/lyrics/match";
-import { selectBest, type ScoreQuery } from "@/lib/lyrics/score";
+import {
+  scoreCandidate,
+  selectBest,
+  type ScoreQuery,
+} from "@/lib/lyrics/score";
 import { reattributedFromTitle } from "@/lib/track-meta";
 import {
   createDeadline,
@@ -54,6 +58,35 @@ async function headers(): Promise<Record<string, string>> {
     "Lrclib-Client": `YTubic${version} (https://github.com/ameenalasady/YTubic)`,
   };
   return cachedHeaders;
+}
+
+/**
+ * Diagnostics, written to the WEBVIEW console (F12 / right-click, Inspect).
+ * The terminal that runs `tauri dev` only shows the Rust side, which is why
+ * nothing about lyrics ever appeared there.
+ */
+function log(...args: unknown[]) {
+  console.info("[lyrics:lrclib]", ...args);
+}
+
+function describeRecord(r: LrclibRecord): string {
+  const body = r.lyricsfile
+    ? "words"
+    : r.syncedLyrics
+      ? "synced"
+      : r.plainLyrics
+        ? "plain"
+        : "empty";
+  return `"${r.trackName}" by "${r.artistName}" ${r.duration ?? "?"}s [${body}]`;
+}
+
+/** The few best-scoring rejects with the reason each was refused. */
+function explainRejects(q: ScoreQuery, pool: LrclibRecord[]): string[] {
+  return pool
+    .map((r) => ({ r, v: scoreCandidate(q, r) }))
+    .sort((a, b) => b.v.score - a.v.score)
+    .slice(0, 5)
+    .map(({ r, v }) => `${describeRecord(r)} -> ${v.reason}`);
 }
 
 type LrclibParams = {
@@ -161,7 +194,13 @@ async function lookup(
   };
   const pool = [...(get ? [get] : []), ...search];
   const best = selectBest(query, pool);
+  log(
+    `"${p.title}" / "${p.artist ?? "-"}" / ${p.duration ?? "?"}s:`,
+    `get=${get ? "hit" : "miss"}, search=${search.length} rows,`,
+    best ? `picked ${describeRecord(best.record)}` : "nothing accepted",
+  );
   if (best) return mapRecord(best.record, best.verdict.suppressSynced);
+  if (pool.length > 0) log("closest rejects:", explainRejects(query, pool));
 
   // Nothing survived scoring. Whether that is an answer depends on whether
   // both endpoints actually answered.
@@ -179,11 +218,18 @@ async function lookup(
   const singles = [...new Set(p.artists ?? [])]
     .filter((a) => a && a !== p.artist)
     .slice(0, 3);
+  // A single credit was already asked for exactly; asking again would only
+  // cost every lyric-less track an extra request.
   if (singles.length === 0) return null;
+  const lead = singles[0];
 
   const extra = await Promise.allSettled([
-    lrclibGet({ ...p, artist: singles[0] }, deadline),
+    lrclibGet({ ...p, artist: lead }, deadline),
     ...singles.map((a) => lrclibSearch({ ...p, artist: a }, deadline)),
+    // Free-text search over every field. It does not care how the record
+    // splits "DVRST, monrxe - Darling" between title and artist, which is
+    // exactly where the structured queries lose it.
+    lrclibSearchText(`${p.title} ${lead}`, deadline),
   ]);
   const extraPool: LrclibRecord[] = [];
   let anyFulfilled = false;
@@ -198,6 +244,14 @@ async function lookup(
     if (failed && failed.status === "rejected") throw failed.reason;
   }
   const retry = selectBest(query, extraPool);
+  log(
+    `retry with artists ${JSON.stringify(singles)} and free text:`,
+    `${extraPool.length} rows,`,
+    retry ? `picked ${describeRecord(retry.record)}` : "nothing accepted",
+  );
+  if (!retry && extraPool.length > 0) {
+    log("closest rejects:", explainRejects(query, extraPool));
+  }
   return retry ? mapRecord(retry.record, retry.verdict.suppressSynced) : null;
 }
 
@@ -240,6 +294,18 @@ async function lrclibSearch(
   // having synced lyrics, which empties the result set for tracks whose
   // only correct records are plain, and on a generic title concentrates
   // the survivors onto strangers.
+  return Array.isArray(results) ? results : [];
+}
+
+async function lrclibSearchText(
+  q: string,
+  deadline: Deadline,
+): Promise<LrclibRecord[]> {
+  const url = new URL("https://lrclib.net/api/search");
+  url.searchParams.set("q", q);
+  const r = await lyricsFetch(url.toString(), deadline, await headers());
+  if (!r.ok) throwForStatus(r.status, "LRCLIB /search?q");
+  const results = (await r.json()) as LrclibRecord[];
   return Array.isArray(results) ? results : [];
 }
 

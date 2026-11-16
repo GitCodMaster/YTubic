@@ -353,7 +353,24 @@ function stripArtistAffix(title: string, artist?: string): string {
   ) {
     return parts[0];
   }
-  const kept = parts.filter((p) => normalizeForScore(p) !== na);
+  // A part is an artist credit when it is the whole credit, one of the
+  // credited names, or several names out of it: "DVRST, monrxe - Darling"
+  // is filed under the artist "DVRST", and the request's credit is
+  // "DVRST, monrxe". Single tokens only count on an exact name match, so a
+  // title word that merely appears in a credit is not stripped.
+  const names = (artist ?? "")
+    .split(/[,;/\\|&]/)
+    .map((n) => normalizeForScore(n))
+    .filter(Boolean);
+  const known = artistTokens(artist);
+  const isCredit = (p: string): boolean => {
+    const n = normalizeForScore(p);
+    if (!n) return false;
+    if (n === na || names.includes(n)) return true;
+    const t = artistTokens(p);
+    return t.size >= 2 && [...t].every((x) => known.has(x));
+  };
+  const kept = parts.filter((p) => !isCredit(p));
   return kept.length > 0 ? kept.join(" - ") : title;
 }
 

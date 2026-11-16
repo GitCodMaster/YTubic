@@ -203,6 +203,10 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
     if (!videoId || reloadingRef.current) return;
     reloadingRef.current = true;
     setReloading(true);
+    console.info(
+      `[lyrics] reload requested for "${track?.title}" (${videoId});`,
+      `failed sources: ${failed.join(", ") || "none"}`,
+    );
     try {
       // `refetch` always goes to the network, whatever the cache holds. A
       // source that failed to answer is tried again in the same go, which
@@ -219,6 +223,14 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
       // The track changed while this was in flight: the answer belongs to
       // the old one, so show nothing and say nothing.
       if (trackIdRef.current !== videoId) return;
+      console.info(
+        "[lyrics] reload finished:",
+        result.isError
+          ? "error"
+          : result.data
+            ? `${result.data.kind} lyrics${hasWordSync(result.data) ? " (word synced)" : ""}`
+            : "no lyrics",
+      );
       if (result.isError) {
         console.error("[lyrics] LRCLIB reload failed:", result.error);
         toast.error("Couldn't reach LRCLIB", {
@@ -234,7 +246,7 @@ export function useLyricsView(track: QueueTrack | undefined): LyricsViewState {
       reloadingRef.current = false;
       setReloading(false);
     }
-  }, [track?.videoId, refetchLrclib, failed, queries]);
+  }, [track?.videoId, track?.title, refetchLrclib, failed, queries]);
 
   return {
     active,
@@ -572,7 +584,20 @@ function TimedLyrics({
       >
         {lines.map((line, i) => {
           const isActive = i === activeIdx;
-          const isPast = i < activeIdx;
+          // A word-synced line is handed over to the next one
+          // ACTIVE_LOOKAHEAD_S before that one starts, which is earlier
+          // than the last words of a fast line are sung. Cutting the
+          // highlight there made the tail of the line vanish at once, so
+          // such a line stays lit until its own last word is done.
+          const lastWord = line.words?.[line.words.length - 1];
+          const finishing =
+            !isActive &&
+            i < activeIdx &&
+            !!lastWord &&
+            position >= line.start &&
+            position < lastWord.end + WORD_TAIL_S;
+          const lit = isActive || finishing;
+          const isPast = i < activeIdx && !lit;
           return (
             <button
               key={i}
@@ -598,14 +623,14 @@ function TimedLyrics({
                 large
                   ? "px-3 py-3.5 text-[31px] font-bold leading-[1.18] tracking-[-0.025em]"
                   : "text-lg",
-                isActive
+                lit
                   ? "scale-[1.06] text-foreground"
                   : isPast
                     ? "scale-100 text-muted-foreground/40"
                     : "scale-100 text-muted-foreground/70",
               )}
             >
-              {isActive && line.words?.length ? (
+              {lit && line.words?.length ? (
                 <WordLine words={line.words} />
               ) : (
                 line.text || "♪"
@@ -654,6 +679,10 @@ function TimedLyrics({
  * stalled stream cannot run the highlight away.
  */
 const EXTRAPOLATE_CAP_S = 0.6;
+
+/** How long a finished word-synced line stays in its lit state, so the last
+ *  word is seen filling before the line steps back. */
+const WORD_TAIL_S = 0.15;
 
 function WordLine({ words }: { words: TimedWord[] }) {
   const fills = useRef<(HTMLSpanElement | null)[]>([]);
