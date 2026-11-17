@@ -50,6 +50,9 @@ type State = {
    *  each word, "bounce" snaps each word on with a springy pop. Only
    *  matters for lyrics that carry word timings. (Fork.) */
   lyricsWordStyle: LyricsWordStyle;
+  /** A soft glow with a red/cyan colour fringe on the lit lyric words.
+   *  Static text-shadow only (no filters), off by default. (Fork.) */
+  lyricsGlow: boolean;
   /** Check GitHub Releases at launch and download a newer version in
    *  the background, leaving only the restart to the user (see
    *  `lib/updater.ts`). Off: no check at launch, and a check run from
@@ -79,6 +82,7 @@ type State = {
   setPlaybackNotifications: (v: boolean) => void;
   setLyricsEnabled: (v: boolean) => void;
   setLyricsWordStyle: (v: LyricsWordStyle) => void;
+  setLyricsGlow: (v: boolean) => void;
   setAutoUpdate: (v: boolean) => void;
   setWindowGlow: (v: boolean) => void;
   setWindowGlowCover: (v: boolean) => void;
@@ -106,6 +110,7 @@ export const useSettingsStore = create<State>()(
       playbackNotifications: false,
       lyricsEnabled: true,
       lyricsWordStyle: "flow",
+      lyricsGlow: false,
       autoUpdate: true,
       windowGlow: false,
       windowGlowCover: true,
@@ -123,6 +128,7 @@ export const useSettingsStore = create<State>()(
         set({ playbackNotifications }),
       setLyricsEnabled: (lyricsEnabled) => set({ lyricsEnabled }),
       setLyricsWordStyle: (lyricsWordStyle) => set({ lyricsWordStyle }),
+      setLyricsGlow: (lyricsGlow) => set({ lyricsGlow }),
       setAutoUpdate: (autoUpdate) => set({ autoUpdate }),
       setWindowGlow: (windowGlow) => set({ windowGlow }),
       setWindowGlowCover: (windowGlowCover) => set({ windowGlowCover }),

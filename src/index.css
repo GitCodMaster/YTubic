@@ -861,6 +861,37 @@
     transition: opacity 110ms ease-out;
   }
 
+  /* Optional glow on the lit lyric words: a red and a cyan copy of the
+     glyphs peeking out left and right (the chromatic fringe) plus a soft
+     white halo. Static text-shadow only: it is rasterised when the word
+     appears and costs nothing per frame in "Bounce"; no filters, no
+     backdrop-filter. */
+  .lyrics-glow {
+    text-shadow:
+      -0.05em 0 0 rgb(255 70 100 / 0.6),
+      0.05em 0 0 rgb(70 200 255 / 0.6),
+      0 0 0.35em rgb(255 255 255 / 0.3);
+  }
+  /* "Flow" reveals the word through a mask, and a mask clips whatever it
+     does not cover, shadows included. Grow the layer by 0.5em on every
+     side (padding puts the text back where it was) and shift the sweep
+     by the same amount so the highlight still starts and ends on the
+     glyphs. */
+  .lyrics-word-fill.lyrics-glow {
+    inset: -0.5em;
+    padding: 0.5em;
+    -webkit-mask-image: linear-gradient(
+      90deg,
+      #000 calc(0.5em + var(--p) * (100% - 1em + var(--e)) - var(--e)),
+      transparent calc(0.5em + var(--p) * (100% - 1em + var(--e)))
+    );
+    mask-image: linear-gradient(
+      90deg,
+      #000 calc(0.5em + var(--p) * (100% - 1em + var(--e)) - var(--e)),
+      transparent calc(0.5em + var(--p) * (100% - 1em + var(--e)))
+    );
+  }
+
   /* Fine SVG noise overlaid on the heavily-blurred `BackgroundCover` art.
      Without it, `blur-3xl` produces gradients smooth enough to lose
      precision through 8-bit channel quantization — especially in the

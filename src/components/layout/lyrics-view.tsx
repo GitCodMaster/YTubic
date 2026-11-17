@@ -702,6 +702,7 @@ const WORD_TAIL_S = 0.15;
 
 function WordLine({ words }: { words: TimedWord[] }) {
   const mode = useSettingsStore((s) => s.lyricsWordStyle);
+  const glow = useSettingsStore((s) => s.lyricsGlow);
   const fills = useRef<(HTMLSpanElement | null)[]>([]);
   const wraps = useRef<(HTMLSpanElement | null)[]>([]);
 
@@ -791,6 +792,7 @@ function WordLine({ words }: { words: TimedWord[] }) {
                   className={cn(
                     "absolute inset-0",
                     mode === "bounce" ? "lyrics-word-snap" : "lyrics-word-fill",
+                    glow && "lyrics-glow",
                   )}
                   ref={(el) => {
                     fills.current[i] = el;
@@ -842,6 +844,8 @@ export function LyricsSourceButton({
   const { pref, setPref, best, availability, enabled, setEnabled } = state;
   const wordStyle = useSettingsStore((s) => s.lyricsWordStyle);
   const setWordStyle = useSettingsStore((s) => s.setLyricsWordStyle);
+  const glow = useSettingsStore((s) => s.lyricsGlow);
+  const setGlow = useSettingsStore((s) => s.setLyricsGlow);
 
   return (
     <DropdownMenu>
@@ -945,6 +949,14 @@ export function LyricsSourceButton({
             Bounce
           </DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
+        <DropdownMenuCheckboxItem
+          checked={glow}
+          disabled={!enabled}
+          onCheckedChange={setGlow}
+          onSelect={(e) => e.preventDefault()}
+        >
+          Glow
+        </DropdownMenuCheckboxItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
