@@ -103,7 +103,7 @@ type LrclibParams = {
   artists?: string[];
 };
 
-type LrclibRecord = {
+export type LrclibRecord = {
   id?: number;
   trackName?: string;
   artistName?: string;
@@ -134,6 +134,45 @@ export async function fetchLrclibLyrics(
     const alt = reattributedFromTitle(p.title, p.artist);
     if (!alt) return null;
     return await lookup({ ...p, title: alt.title, artist: alt.artist }, deadline);
+  } finally {
+    deadline.done();
+  }
+}
+
+/**
+ * Every record LRCLIB has for a title and artist, unscored, for callers
+ * that pick by something other than the scorer's own duration check (the
+ * slowed-version lookup knows the duration it wants only as a range).
+ * Asks with the joined credit, with each artist alone, and as free text,
+ * for the reasons given in `lookup`. Throws only when nothing answered.
+ */
+export async function fetchLrclibCandidates(
+  p: LrclibParams,
+  signal?: AbortSignal,
+): Promise<LrclibRecord[]> {
+  if (!p.title) return [];
+  const deadline = createDeadline(signal);
+  try {
+    const singles = [...new Set(p.artists ?? [])]
+      .filter((a) => a && a !== p.artist)
+      .slice(0, 3);
+    const results = await Promise.allSettled([
+      lrclibSearch(p, deadline),
+      ...singles.map((a) => lrclibSearch({ ...p, artist: a }, deadline)),
+      lrclibSearchText(`${p.title} ${singles[0] ?? p.artist ?? ""}`.trim(), deadline),
+    ]);
+    const pool: LrclibRecord[] = [];
+    let answered = false;
+    for (const r of results) {
+      if (r.status !== "fulfilled") continue;
+      answered = true;
+      pool.push(...r.value);
+    }
+    if (!answered) {
+      const failed = results.find((r) => r.status === "rejected");
+      if (failed && failed.status === "rejected") throw failed.reason;
+    }
+    return pool;
   } finally {
     deadline.done();
   }

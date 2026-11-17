@@ -300,6 +300,14 @@ export function LyricsBody({
         <LyricsContent state={state} large={large} />
       </motion.div>
       <LyricsReloadButton reloading={state.reloading} onReload={state.reload} />
+      {state.active?.kind === "timed" && state.active.adjusted ? (
+        <div
+          className="pointer-events-none absolute bottom-3 left-3 rounded-full bg-black/40 px-2.5 py-1 text-[11px] text-muted-foreground backdrop-blur-sm"
+          title={`Timings scaled from "${state.active.adjusted.from}" (speed ${state.active.adjusted.ratio.toFixed(2)}x). Only accurate for full slowed versions.`}
+        >
+          Adjusted from original · Beta
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -883,6 +891,10 @@ export function LyricsSourceButton({
           <DropdownMenuSeparator />
           {SOURCE_ORDER.map((s) => {
             const a = availability[s];
+            // The slowed-version source only exists for slowed uploads.
+            if (s === "slowed" && a === "none" && pref !== "slowed") {
+              return null;
+            }
             const dot =
               a === "lrc" || a === "words"
                 ? "bg-brand"
@@ -903,6 +915,11 @@ export function LyricsSourceButton({
                 disabled={!enabled || a === "none"}
               >
                 <span className="flex-1">{SOURCE_LABELS[s]}</span>
+                {s === "slowed" ? (
+                  <span className="ml-2 rounded bg-brand/15 px-1 text-[10px] uppercase tracking-wide text-brand">
+                    Beta
+                  </span>
+                ) : null}
                 {a === "words" ? (
                   <span className="ml-2 text-[10px] uppercase tracking-wide text-muted-foreground">
                     Words

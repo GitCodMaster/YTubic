@@ -4,6 +4,7 @@ import { fetchLrclibLyrics } from "@/lib/lyrics/lrclib";
 import { fetchMusixmatchLyrics } from "@/lib/lyrics/musixmatch";
 import { fetchGeniusLyrics } from "@/lib/lyrics/genius";
 import { fetchYtMusicLyrics } from "@/lib/lyrics/ytmusic";
+import { fetchSlowedLyrics, slowedBaseTitle } from "@/lib/lyrics/slowed";
 import { shouldRetryLyricsQuery } from "@/lib/lyrics/http";
 import {
   cleanTrackTitle,
@@ -13,7 +14,12 @@ import {
 import { hasWordSync, type Lyrics } from "@/lib/lyrics/types";
 import { usePlaybackStore, type QueueTrack } from "@/lib/store/playback";
 
-export type LyricsSource = "ytmusic" | "lrclib" | "musixmatch" | "genius";
+export type LyricsSource =
+  | "ytmusic"
+  | "lrclib"
+  | "musixmatch"
+  | "genius"
+  | "slowed";
 
 /**
  * Preference order. YouTube Music leads because it is the only source
@@ -25,6 +31,8 @@ export const SOURCE_ORDER: LyricsSource[] = [
   "lrclib",
   "musixmatch",
   "genius",
+  // Last: derived from another recording, so it only ever fills a gap.
+  "slowed",
 ];
 
 export const SOURCE_LABELS: Record<LyricsSource, string> = {
@@ -32,6 +40,7 @@ export const SOURCE_LABELS: Record<LyricsSource, string> = {
   lrclib: "LRCLIB",
   musixmatch: "Musixmatch",
   genius: "Genius",
+  slowed: "Slowed (from original)",
 };
 
 const ONE_HOUR = 60 * 60 * 1000;
@@ -155,17 +164,52 @@ export function useLyricsSources(track: QueueTrack | undefined, enabled: boolean
     retry: shouldRetryLyricsQuery,
   });
 
+  // Beta: a "slowed + reverb" upload usually has no lyrics of its own, but
+  // the original does, and a slowdown is a uniform stretch of its timings.
+  // Only asked for when the title says slowed and the duration is known
+  // (the scale factor is the ratio of the two lengths).
+  const slowed = useQuery({
+    queryKey: [
+      "lyrics",
+      "slowed",
+      LOOKUP_VERSION,
+      track?.title,
+      artistName,
+      duration !== undefined ? Math.round(duration) : undefined,
+    ],
+    queryFn: ({ signal }) =>
+      fetchSlowedLyrics(
+        {
+          title: track!.title,
+          artist: artistName,
+          artists: artistList,
+          duration: duration!,
+        },
+        signal,
+      ),
+    enabled:
+      !!track &&
+      enabled &&
+      duration !== undefined &&
+      slowedBaseTitle(track.title) !== null,
+    staleTime: ONE_HOUR,
+    retry: shouldRetryLyricsQuery,
+  });
+
   const queries: Record<LyricsSource, UseQueryResult<Lyrics | null>> = {
     ytmusic,
     lrclib,
     musixmatch,
     genius,
+    slowed,
   };
 
   let best: LyricsSource | null = null;
   // Word-synced lyrics beat line-synced ones, whichever source has them:
   // only LRCLIB can provide them, and it ranks below YouTube Music.
   for (const s of SOURCE_ORDER) {
+    // A derived result never outranks a real line-synced one.
+    if (s === "slowed") continue;
     if (hasWordSync(queries[s].data)) {
       best = s;
       break;

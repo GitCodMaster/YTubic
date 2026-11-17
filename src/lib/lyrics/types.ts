@@ -28,5 +28,12 @@ export function hasWordSync(l: Lyrics | null | undefined): boolean {
 }
 
 export type Lyrics =
-  | { kind: "timed"; lines: TimedLine[]; source?: string }
+  | {
+      kind: "timed";
+      lines: TimedLine[];
+      source?: string;
+      /** Set when the timings were derived from another recording (a slowed
+       *  version's lyrics scaled from the original's). Beta. */
+      adjusted?: { ratio: number; from: string };
+    }
   | { kind: "plain"; text: string; source?: string };
