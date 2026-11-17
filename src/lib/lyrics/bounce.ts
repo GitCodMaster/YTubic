@@ -7,7 +7,7 @@
  * the first peak lands almost at once; the 1.85 gain normalises that peak to
  * about 1 (exp(-6.5 * 0.096) * sin(pi / 2) is ~0.54).
  */
-const FREQ_HZ = 2.6;
+const FREQ_HZ = 2.8;
 const DECAY = 6.5;
 const GAIN = 1.85;
 /** Past this the spring is below visibility; treated as at rest. */
