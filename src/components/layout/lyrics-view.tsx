@@ -37,6 +37,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
+  currentWordIndex,
+  isGlowing,
+  lineTailEnd,
+} from "@/lib/lyrics/glow";
+import {
   POP_REST_S,
   popTransform,
   popStrength,
@@ -605,13 +610,17 @@ function TimedLyrics({
           // than the last words of a fast line are sung. Cutting the
           // highlight there made the tail of the line vanish at once, so
           // such a line stays lit until its own last word is done.
-          const lastWord = line.words?.[line.words.length - 1];
+          // Stays lit until the last word's pop and glow fade are done
+          // (`lineTailEnd`), not just until its end: unmounting earlier
+          // cut the final words off mid-animation.
+          const words = line.words;
           const finishing =
             !isActive &&
             i < activeIdx &&
-            !!lastWord &&
+            words !== undefined &&
+            words.length > 0 &&
             position >= line.start &&
-            position < lastWord.end + WORD_TAIL_S;
+            position < lineTailEnd(words);
           const lit = isActive || finishing;
           const isPast = i < activeIdx && !lit;
           return (
@@ -696,9 +705,7 @@ function TimedLyrics({
  */
 const EXTRAPOLATE_CAP_S = 0.6;
 
-/** How long a finished word-synced line stays in its lit state, so the last
- *  word is seen filling before the line steps back. */
-const WORD_TAIL_S = 0.15;
+
 
 function WordLine({ words }: { words: TimedWord[] }) {
   const mode = useSettingsStore((s) => s.lyricsWordStyle);
@@ -724,6 +731,8 @@ function WordLine({ words }: { words: TimedWord[] }) {
     const unsubScrub = useScrubStore.subscribe(reanchor);
 
     const last: (number | string)[] = [];
+    // Which word the glow last sat on; -2 forces the first update.
+    let glowAt = -2;
     let raf = 0;
     const tick = () => {
       const scrub = useScrubStore.getState().scrub;
@@ -758,6 +767,21 @@ function WordLine({ words }: { words: TimedWord[] }) {
         last[i] = p;
         el.style.setProperty("--p", p.toFixed(3));
       }
+      if (glow) {
+        // Only the current word and the one before it glow. The class is
+        // toggled only when the pair changes, once per word, and the CSS
+        // transition fades the glow out of the words that leave the pair.
+        const cur = currentWordIndex(words, t);
+        if (cur !== glowAt) {
+          glowAt = cur;
+          for (let i = 0; i < words.length; i++) {
+            fills.current[i]?.classList.toggle(
+              "lyrics-glow-on",
+              isGlowing(i, cur),
+            );
+          }
+        }
+      }
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
@@ -766,7 +790,7 @@ function WordLine({ words }: { words: TimedWord[] }) {
       unsubPlayback();
       unsubScrub();
     };
-  }, [words, mode]);
+  }, [words, mode, glow]);
 
   return (
     <>
@@ -792,7 +816,7 @@ function WordLine({ words }: { words: TimedWord[] }) {
                   className={cn(
                     "absolute inset-0",
                     mode === "bounce" ? "lyrics-word-snap" : "lyrics-word-fill",
-                    glow && "lyrics-glow",
+                    glow && "lyrics-glow-host",
                   )}
                   ref={(el) => {
                     fills.current[i] = el;
