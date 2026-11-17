@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 
+export type LyricsWordStyle = "flow" | "bounce";
+
 export type CloseButtonAction = "tray" | "quit";
 export type CacheAutoCleanPeriod = "off" | "daily" | "weekly" | "monthly";
 export type BackgroundMode = "ambient" | "plain";
@@ -44,6 +46,10 @@ type State = {
    *  synced-scroll view entirely, saving network + rAF/CPU cost for
    *  users who don't use lyrics. (Fork.) */
   lyricsEnabled: boolean;
+  /** How word-synced lyrics animate: "flow" sweeps the highlight across
+   *  each word, "bounce" snaps each word on with a springy pop. Only
+   *  matters for lyrics that carry word timings. (Fork.) */
+  lyricsWordStyle: LyricsWordStyle;
   /** Check GitHub Releases at launch and download a newer version in
    *  the background, leaving only the restart to the user (see
    *  `lib/updater.ts`). Off: no check at launch, and a check run from
@@ -72,6 +78,7 @@ type State = {
   setFullscreenLayout: (v: FullscreenLayout) => void;
   setPlaybackNotifications: (v: boolean) => void;
   setLyricsEnabled: (v: boolean) => void;
+  setLyricsWordStyle: (v: LyricsWordStyle) => void;
   setAutoUpdate: (v: boolean) => void;
   setWindowGlow: (v: boolean) => void;
   setWindowGlowCover: (v: boolean) => void;
@@ -98,6 +105,7 @@ export const useSettingsStore = create<State>()(
       fullscreenLayout: "cover",
       playbackNotifications: false,
       lyricsEnabled: true,
+      lyricsWordStyle: "flow",
       autoUpdate: true,
       windowGlow: false,
       windowGlowCover: true,
@@ -114,6 +122,7 @@ export const useSettingsStore = create<State>()(
       setPlaybackNotifications: (playbackNotifications) =>
         set({ playbackNotifications }),
       setLyricsEnabled: (lyricsEnabled) => set({ lyricsEnabled }),
+      setLyricsWordStyle: (lyricsWordStyle) => set({ lyricsWordStyle }),
       setAutoUpdate: (autoUpdate) => set({ autoUpdate }),
       setWindowGlow: (windowGlow) => set({ windowGlow }),
       setWindowGlowCover: (windowGlowCover) => set({ windowGlowCover }),

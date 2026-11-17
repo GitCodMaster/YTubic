@@ -854,6 +854,13 @@
     );
   }
 
+  /* Word-synced lyrics, "Bounce" style: the lit copy of a word is not
+     swept but switched on whole (opacity, set per frame by WordLine). The
+     pop itself is a transform on the word's wrapper. */
+  .lyrics-word-snap {
+    transition: opacity 110ms ease-out;
+  }
+
   /* Fine SVG noise overlaid on the heavily-blurred `BackgroundCover` art.
      Without it, `blur-3xl` produces gradients smooth enough to lose
      precision through 8-bit channel quantization — especially in the

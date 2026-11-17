@@ -37,6 +37,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
+  POP_REST_S,
+  popTransform,
+  popStrength,
+} from "@/lib/lyrics/bounce";
+import {
   hasWordSync,
   type Lyrics,
   type TimedLine,
@@ -51,7 +56,10 @@ import {
 import { usePlaybackStore } from "@/lib/store/playback";
 import type { QueueTrack } from "@/lib/store/playback";
 import { useScrubStore } from "@/lib/store/scrub";
-import { useSettingsStore } from "@/lib/store/settings";
+import {
+  useSettingsStore,
+  type LyricsWordStyle,
+} from "@/lib/store/settings";
 import { cn } from "@/lib/utils";
 
 const PREF_KEY = "ytm:lyrics-source";
@@ -685,7 +693,9 @@ const EXTRAPOLATE_CAP_S = 0.6;
 const WORD_TAIL_S = 0.15;
 
 function WordLine({ words }: { words: TimedWord[] }) {
+  const mode = useSettingsStore((s) => s.lyricsWordStyle);
   const fills = useRef<(HTMLSpanElement | null)[]>([]);
+  const wraps = useRef<(HTMLSpanElement | null)[]>([]);
 
   useEffect(() => {
     const anchor = {
@@ -704,7 +714,7 @@ function WordLine({ words }: { words: TimedWord[] }) {
     });
     const unsubScrub = useScrubStore.subscribe(reanchor);
 
-    const last: number[] = [];
+    const last: (number | string)[] = [];
     let raf = 0;
     const tick = () => {
       const scrub = useScrubStore.getState().scrub;
@@ -716,6 +726,22 @@ function WordLine({ words }: { words: TimedWord[] }) {
         const el = fills.current[i];
         if (!el) continue;
         const w = words[i];
+        if (mode === "bounce") {
+          // Snap on at the word's start and pop; no sweep.
+          const age = t - w.start;
+          const on = age >= 0 ? 1 : 0;
+          const tf =
+            age >= 0 && age < POP_REST_S
+              ? popTransform(age, popStrength(w.end - w.start))
+              : "";
+          const key = `${on}|${tf}`;
+          if (last[i] === key) continue;
+          last[i] = key;
+          el.style.opacity = String(on);
+          const wrap = wraps.current[i];
+          if (wrap) wrap.style.transform = tf;
+          continue;
+        }
         const span = Math.max(w.end - w.start, 0.05);
         const p = Math.min(1, Math.max(0, (t - w.start) / span));
         // Skip untouched words (before or after the one being sung).
@@ -731,7 +757,7 @@ function WordLine({ words }: { words: TimedWord[] }) {
       unsubPlayback();
       unsubScrub();
     };
-  }, [words]);
+  }, [words, mode]);
 
   return (
     <>
@@ -744,15 +770,28 @@ function WordLine({ words }: { words: TimedWord[] }) {
           <Fragment key={i}>
             {lead}
             {core ? (
-              <span className="relative inline-block whitespace-nowrap">
+              <span
+                className="relative inline-block whitespace-nowrap"
+                ref={(el) => {
+                  wraps.current[i] = el;
+                }}
+                style={{ transformOrigin: "50% 85%" }}
+              >
                 <span className="opacity-40">{core}</span>
                 <span
                   aria-hidden
-                  className="lyrics-word-fill absolute inset-0"
+                  className={cn(
+                    "absolute inset-0",
+                    mode === "bounce" ? "lyrics-word-snap" : "lyrics-word-fill",
+                  )}
                   ref={(el) => {
                     fills.current[i] = el;
                   }}
-                  style={{ "--p": 0 } as React.CSSProperties}
+                  style={
+                    mode === "bounce"
+                      ? { opacity: 0 }
+                      : ({ "--p": 0 } as React.CSSProperties)
+                  }
                 >
                   {core}
                 </span>
@@ -793,6 +832,8 @@ export function LyricsSourceButton({
   className?: string;
 }) {
   const { pref, setPref, best, availability, enabled, setEnabled } = state;
+  const wordStyle = useSettingsStore((s) => s.lyricsWordStyle);
+  const setWordStyle = useSettingsStore((s) => s.setLyricsWordStyle);
 
   return (
     <DropdownMenu>
@@ -873,6 +914,19 @@ export function LyricsSourceButton({
               </DropdownMenuRadioItem>
             );
           })}
+        </DropdownMenuRadioGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel inset>Word animation</DropdownMenuLabel>
+        <DropdownMenuRadioGroup
+          value={wordStyle}
+          onValueChange={(v) => setWordStyle(v as LyricsWordStyle)}
+        >
+          <DropdownMenuRadioItem value="flow" disabled={!enabled}>
+            Flow
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="bounce" disabled={!enabled}>
+            Bounce
+          </DropdownMenuRadioItem>
         </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
