@@ -17,6 +17,7 @@ import {
   IconSearchFilled,
   IconBookmarks,
   IconBookmarksFilled,
+  IconHistory,
   IconSettings,
   IconPlaylist,
   IconPinFilled,
@@ -108,6 +109,12 @@ const NAV_ITEMS = [
     label: "Library",
     icon: IconBookmarks,
     iconOn: IconBookmarksFilled,
+  },
+  {
+    to: "/history",
+    label: "History",
+    icon: IconHistory,
+    iconOn: IconHistory,
   },
 ] as const;
 

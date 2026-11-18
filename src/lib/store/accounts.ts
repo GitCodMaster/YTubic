@@ -12,6 +12,7 @@ import { usePlaybackStore } from "@/lib/store/playback";
 import { usePinnedPlaylistsStore } from "@/lib/store/pinned-playlists";
 import { usePremiumStore } from "@/lib/store/premium";
 import { useSearchHistory } from "@/lib/store/search-history";
+import { usePlayLog } from "@/lib/store/play-log";
 import { useTrackSourceStore } from "@/lib/store/track-source";
 
 export type AccountSummary = {
@@ -207,6 +208,8 @@ export function useAccountsChangedListener(): void {
       // 3. Other per-account local state: typed search history,
       //    per-track Song↔Video preferences, cached Premium status.
       useSearchHistory.getState().clear();
+      // The device's play log belongs to the account that was playing.
+      usePlayLog.getState().clear();
       useTrackSourceStore.setState({ byVideoId: {} });
       usePremiumStore.setState({ status: null });
 

@@ -30,6 +30,7 @@ import { useAudioEngine } from "@/lib/audio-engine";
 import { useCacheAutoClean } from "@/lib/cache-cleanup";
 import { usePlaybackNotifications } from "@/lib/playback-notifications";
 import { useLastfmScrobbler } from "@/lib/lastfm/scrobbler";
+import { usePlayLogger } from "@/lib/use-play-logger";
 import { useYtdlpSetup } from "@/lib/ytdlp";
 import { useUpdateStartupCheck } from "@/lib/updater";
 import { useDeepLinks } from "@/lib/use-deep-links";
@@ -139,6 +140,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   useCacheAutoClean();
   usePlaybackNotifications();
   useLastfmScrobbler();
+  usePlayLogger();
   const mode = useLayoutStore((s) => s.mode);
   const settingsOpen = useSettingsDialog((s) => s.open);
   const fullscreenOpen = useFullscreenStore((s) => s.open);
